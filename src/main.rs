@@ -238,34 +238,17 @@ pub fn kfree(_ptr: *mut u8) {
 }
 
 // ============================================================
-// Page tables (identity map, MMU still OFF)
+// Page tables + MMU registers (MMU still OFF)
 // ============================================================
 //
-// ARM64 4KB-granule translation:
-//   - 4 levels: L0 -> L1 -> L2 -> L3
-//   - Each table is 4KB (512 entries, 8 bytes each)
-//   - L1 blocks: 1GB, L2 blocks: 2MB, L3 pages: 4KB
-//
-// We build a minimal identity map using L1 block descriptors:
-//   L0[0] -> L1
-//   L1[0] -> 0x0000_0000..0x4000_0000 as DEVICE memory  (covers GIC, UART)
-//   L1[1] -> 0x4000_0000..0x8000_0000 as NORMAL memory  (RAM, kernel, heap)
-//
-// Offsets inside L1: entry index = virtual address >> 30.
-
-// Descriptor bits (from ARMv8-A spec, section D8.3)
+// Descriptor bits (from ARMv8-A spec, D8.3)
 const DESC_VALID:  u64 = 1 << 0;
-const DESC_TABLE:  u64 = 1 << 1;   // block vs table: 1 = table (for L0..L2)
-const DESC_AF:     u64 = 1 << 10;  // Access Flag
+const DESC_TABLE:  u64 = 1 << 1;
+const DESC_AF:     u64 = 1 << 10;
 const DESC_SH_INNER: u64 = 0b11 << 8;
 
-// MAIR indices: we set MAIR[0] = Normal, MAIR[1] = Device
 const DESC_ATTR_NORMAL: u64 = 0 << 2;
 const DESC_ATTR_DEVICE: u64 = 1 << 2;
-
-// For a block descriptor at L1, bit 1 must be 0 (block) and bit 0 = 1 (valid).
-// But the raw L1 entry for a table has bit 1 = 1.
-// Block descriptors are stored with bit 1 = 0.
 
 const BLOCK_NORMAL: u64 =
     DESC_VALID | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL;
@@ -274,41 +257,79 @@ const BLOCK_DEVICE: u64 =
 
 const TABLE_ENTRY: u64 = DESC_VALID | DESC_TABLE;
 
-// Page tables must be 4KB-aligned. We reserve a static-aligned region.
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
 
 static mut TT_L0: PageTable = PageTable([0; 512]);
 static mut TT_L1: PageTable = PageTable([0; 512]);
 
-// Save the physical base of TT_L0 so we can reference it later
 static TT_L0_PHYS: AtomicUsize = AtomicUsize::new(0);
 
 fn page_tables_init() {
     unsafe {
-        // L0[0] = pointer to TT_L1 as a table descriptor
-        let l0 = &mut TT_L0 as *mut PageTable as *mut u64;
-        let l1 = &mut TT_L1 as *mut PageTable as *mut u64;
+        let l0 = core::ptr::addr_of_mut!(TT_L0) as *mut u64;
+        let l1 = core::ptr::addr_of_mut!(TT_L1) as *mut u64;
         *l0 = (l1 as u64) | TABLE_ENTRY;
 
-        // L1[0] = block descriptor mapping 0x0000_0000..0x4000_0000 as DEVICE
-        // L1[1] = block descriptor mapping 0x4000_0000..0x8000_0000 as NORMAL
-        let l1_slice = &mut TT_L1.0;
-        l1_slice[0] = (0x0000_0000u64) | BLOCK_DEVICE;
-        l1_slice[1] = (0x4000_0000u64) | BLOCK_NORMAL;
+        let l1_slice = core::ptr::addr_of_mut!(TT_L1.0) as *mut u64;
+        *l1_slice.add(0) = (0x0000_0000u64) | BLOCK_DEVICE;
+        *l1_slice.add(1) = (0x4000_0000u64) | BLOCK_NORMAL;
 
-        // Zero the rest (already zero, but be explicit)
         for i in 2..512 {
-            l1_slice[i] = 0;
+            *l1_slice.add(i) = 0;
         }
 
-        // Save L0 physical base
         TT_L0_PHYS.store(l0 as usize, Ordering::Relaxed);
     }
 }
 
 fn tt_l0_phys() -> usize {
     TT_L0_PHYS.load(Ordering::Relaxed)
+}
+
+// ------------------------------------------------------------
+// MMU control registers
+// ------------------------------------------------------------
+
+/// MAIR_EL1: attribute index 0 = Normal WB, index 1 = Device-nGnRE
+const MAIR_VALUE: u64 = 0x0000_0000_0000_04FF;
+
+/// TCR_EL1: T0SZ=16 (48-bit VA), TG0=4KB, SH0=inner,
+///          ORGN0/IRGN0=WBWA, EPD1=1 (no TTBR1), IPS=40-bit
+const TCR_VALUE: u64 = 0x0000_0000_3080_3510;
+
+fn mmu_configure() {
+    let ttbr0 = tt_l0_phys() as u64;
+    unsafe {
+        core::arch::asm!("msr mair_el1, {v}", v = in(reg) MAIR_VALUE, options(nostack, nomem));
+        core::arch::asm!("msr tcr_el1,  {v}", v = in(reg) TCR_VALUE,  options(nostack, nomem));
+        core::arch::asm!("msr ttbr0_el1, {v}", v = in(reg) ttbr0,     options(nostack, nomem));
+        core::arch::asm!("isb", options(nostack, nomem));
+    }
+}
+
+fn read_mair() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, mair_el1", out(reg) v, options(nostack, nomem)); }
+    v
+}
+
+fn read_tcr() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, tcr_el1", out(reg) v, options(nostack, nomem)); }
+    v
+}
+
+fn read_ttbr0() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, ttbr0_el1", out(reg) v, options(nostack, nomem)); }
+    v
+}
+
+fn read_sctlr() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, sctlr_el1", out(reg) v, options(nostack, nomem)); }
+    v
 }
 
 // ============================================================
@@ -710,6 +731,7 @@ fn handle_command(line: &str) {
             println!("  alloc <size>             - allocate memory (bump)");
             println!("  heap                     - show heap statistics");
             println!("  ptdump                   - dump page table entries");
+            println!("  mmu                      - show MMU registers");
             println!("  halt                     - stop the CPU cleanly");
             println!("  panic                    - trigger a kernel panic");
             println!("  reboot                   - reset the system (PSCI)");
@@ -945,6 +967,21 @@ fn handle_command(line: &str) {
             }
             println!("MMU: currently OFF");
         }
+        "mmu" => {
+            println!("MAIR_EL1:  {:#018x}", read_mair());
+            println!("TCR_EL1:   {:#018x}", read_tcr());
+            println!("TTBR0_EL1: {:#018x}", read_ttbr0());
+            println!("SCTLR_EL1: {:#018x}", read_sctlr());
+            let sctlr = read_sctlr();
+            if (sctlr & 1) == 0 {
+                println!("MMU: OFF (SCTLR_EL1.M = 0)");
+            } else {
+                println!("MMU: ON  (SCTLR_EL1.M = 1)");
+            }
+            println!("Expected MAIR:   {:#018x}", MAIR_VALUE);
+            println!("Expected TCR:    {:#018x}", TCR_VALUE);
+            println!("Expected TTBR0:  {:#018x}", tt_l0_phys());
+        }
         "halt" => {
             println!("Halting...");
             sleep_ms(100);
@@ -980,8 +1017,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.8a");
-    println!("    Page Tables (MMU off)");
+    println!("     AdityaOS Shell v1.8b");
+    println!("   MMU Registers (MMU off)");
     println!("=================================");
     println!();
 
@@ -1105,8 +1142,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.8a\n", 3);
-    print_slow("    Page Tables (MMU off)\n", 3);
+    print_slow("       AdityaOS v1.8b\n", 3);
+    print_slow("   MMU Registers (MMU off)\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
@@ -1121,7 +1158,14 @@ pub extern "C" fn kmain() -> ! {
     println!("Building page tables (identity map)...");
     page_tables_init();
     println!("  TT_L0 at {:#x}", tt_l0_phys());
-    println!("  L1 maps: 0x00000000..0x40000000 (DEVICE), 0x40000000..0x80000000 (NORMAL)");
+
+    println!("Configuring MMU registers...");
+    mmu_configure();
+    println!("  MAIR_EL1  = {:#018x}", read_mair());
+    println!("  TCR_EL1   = {:#018x}", read_tcr());
+    println!("  TTBR0_EL1 = {:#018x}", read_ttbr0());
+    println!("  SCTLR_EL1 = {:#018x}  (M bit = {})",
+        read_sctlr(), read_sctlr() & 1);
     println!("  MMU: OFF");
 
     let mut buf: [u8; 16] = [0; 16];
