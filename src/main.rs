@@ -251,18 +251,33 @@ const BLOCK_NORMAL: u64 = DESC_VALID | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMA
 const BLOCK_DEVICE: u64 = DESC_VALID | DESC_AF | DESC_ATTR_DEVICE;
 
 const TABLE_ENTRY: u64 = DESC_VALID | DESC_TABLE;
-const L2_TABLE_NORMAL: u64 = DESC_VALID | DESC_TABLE | DESC_AF;
-const L3_PAGE_NORMAL: u64 = DESC_VALID | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL;
+// Table descriptor pointing to the next level. AF=1, no attributes.
+const NEXT_TABLE: u64 = DESC_VALID | DESC_TABLE | DESC_AF;
+// L3 4KB page descriptor: valid, AF, inner shareable, normal memory
+const L3_PAGE_NORMAL: u64 = DESC_VALID | DESC_TABLE | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL;
 
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
 
 const MAX_THREADS: usize = 8;
 
+// ---- Kernel master tables (identity map) ----
 static mut TT_KERNEL_L0: PageTable = PageTable([0; 512]);
 static mut TT_KERNEL_L1: PageTable = PageTable([0; 512]);
 
+// ---- Per-thread tables ----
+// Each thread has a full 4-level walk chain for its private mappings:
+//   L0[1] -> thread L1
+//   L1[l1_idx] -> thread L2
+//   L2[l2_idx] -> thread L3
+//   L3[l3_idx] = 4KB page
+//
+// The kernel identity map is still shared via L0[0] -> kernel L1.
 static mut TT_THREAD_L0: [PageTable; MAX_THREADS] =
+    [PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]),
+     PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512])];
+
+static mut TT_THREAD_L1: [PageTable; MAX_THREADS] =
     [PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]),
      PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512])];
 
@@ -307,10 +322,31 @@ fn thread_page_tables_init() {
 
         for i in 0..MAX_THREADS {
             let l0 = core::ptr::addr_of_mut!(TT_THREAD_L0[i]) as *mut u64;
+            // L0[0] -> shared kernel L1 (identity map)
             *l0 = (kernel_l1 as u64) | TABLE_ENTRY;
-            for j in 1..512 {
+            // L0[1] -> this thread's private L1 (for VA 512GB..1TB)
+            let l1 = core::ptr::addr_of_mut!(TT_THREAD_L1[i]) as *mut u64;
+            *l0.add(1) = (l1 as u64) | TABLE_ENTRY;
+            // L0[2..512] unused
+            for j in 2..512 {
                 *l0.add(j) = 0;
             }
+
+            // Zero the private L1, L2, L3
+            for j in 0..512 {
+                *l1.add(j) = 0;
+            }
+
+            let l2 = core::ptr::addr_of_mut!(TT_THREAD_L2[i]) as *mut u64;
+            for j in 0..512 {
+                *l2.add(j) = 0;
+            }
+
+            let l3 = core::ptr::addr_of_mut!(TT_THREAD_L3[i]) as *mut u64;
+            for j in 0..512 {
+                *l3.add(j) = 0;
+            }
+
             TT_THREAD_L0_PHYS[i].store(l0 as usize, Ordering::Relaxed);
         }
     }
@@ -324,36 +360,66 @@ fn tt_thread_l0_phys(idx: usize) -> usize {
     }
 }
 
-/// Map virtual address `vaddr` to physical page `paddr` for the given thread.
-/// Uses the private L0[1] slot (covers VA range 0x80_0000_0000..0x100_0000_0000,
-/// i.e. 512GB..1TB). One L2 and one L3 per thread for now.
+/// Map virtual address `vaddr` to physical page `paddr` for thread `thread_idx`.
+/// Walks L0->L1->L2->L3, creating intermediate tables on demand.
+/// Only supports VAs in the L0[1] range (512GB..1TB).
+/// Only supports one L2 table and one L3 table per thread for now —
+/// meaning all mappings for a thread must fall inside the same 1GB region.
 fn thread_map_page(thread_idx: usize, vaddr: u64, paddr: u64) -> bool {
     if thread_idx >= MAX_THREADS { return false; }
 
     let l0_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let l1_idx = ((vaddr >> 30) & 0x1FF) as usize;
     let l2_idx = ((vaddr >> 21) & 0x1FF) as usize;
     let l3_idx = ((vaddr >> 12) & 0x1FF) as usize;
 
-    // Only support VAs whose L0 index is 1 (512GB..1TB).
-    // This lets us reuse a single per-thread L2/L3 table without needing
-    // a full tree.
     if l0_idx != 1 { return false; }
 
     unsafe {
         let l0 = core::ptr::addr_of_mut!(TT_THREAD_L0[thread_idx]) as *mut u64;
+        let l1 = core::ptr::addr_of_mut!(TT_THREAD_L1[thread_idx]) as *mut u64;
         let l2 = core::ptr::addr_of_mut!(TT_THREAD_L2[thread_idx]) as *mut u64;
         let l3 = core::ptr::addr_of_mut!(TT_THREAD_L3[thread_idx]) as *mut u64;
 
-        // L0[1] -> private L2 (table descriptor)
-        *l0.add(1) = (l2 as u64) | TABLE_ENTRY;
+        // L0[1] -> L1 (always points to the private L1)
+        *l0.add(1) = (l1 as u64) | TABLE_ENTRY;
 
-        // L2[l2_idx] -> private L3 (table descriptor)
-        *l2.add(l2_idx) = (l3 as u64) | L2_TABLE_NORMAL;
+        // L1[l1_idx] -> L2
+        // Only allow l1_idx == 0 for now (all VAs must be in same 1GB region).
+        // This keeps one L2 and one L3 per thread.
+        if l1_idx != 0 { return false; }
+        *l1.add(l1_idx) = (l2 as u64) | NEXT_TABLE;
+
+        // L2[l2_idx] -> L3
+        *l2.add(l2_idx) = (l3 as u64) | NEXT_TABLE;
 
         // L3[l3_idx] = page descriptor
         *l3.add(l3_idx) = (paddr & !0xFFFu64) | L3_PAGE_NORMAL;
 
-        // Flush TLB and instruction stream
+        core::arch::asm!("dsb ish", options(nostack, nomem));
+        core::arch::asm!("tlbi vmalle1", options(nostack, nomem));
+        core::arch::asm!("dsb ish", options(nostack, nomem));
+        core::arch::asm!("isb", options(nostack, nomem));
+    }
+    true
+}
+
+/// Remove a mapping at vaddr for thread thread_idx by zeroing the L3 entry.
+fn thread_unmap_page(thread_idx: usize, vaddr: u64) -> bool {
+    if thread_idx >= MAX_THREADS { return false; }
+    let l0_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let l1_idx = ((vaddr >> 30) & 0x1FF) as usize;
+    let l2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let l3_idx = ((vaddr >> 12) & 0x1FF) as usize;
+    if l0_idx != 1 || l1_idx != 0 { return false; }
+
+    unsafe {
+        let l2 = core::ptr::addr_of_mut!(TT_THREAD_L2[thread_idx]) as *mut u64;
+        let l2e = core::ptr::read_volatile(l2.add(l2_idx));
+        if (l2e & DESC_VALID) == 0 { return false; }
+        let l3 = (l2e & !0xFFF) as *mut u64;
+        *l3.add(l3_idx) = 0;
+
         core::arch::asm!("dsb ish", options(nostack, nomem));
         core::arch::asm!("tlbi vmalle1", options(nostack, nomem));
         core::arch::asm!("dsb ish", options(nostack, nomem));
@@ -696,6 +762,88 @@ fn spawn_many(n: usize) -> usize {
 }
 
 // ============================================================
+// VM isolation demo
+// ============================================================
+
+// 512GB + 2MB — falls inside L0[1], L1[0], L2[1], L3[0]
+// (all within the single L2/L3 region we support per thread)
+const DEMO_VA: u64 = 0x80_0000_0000 + 0x20_0000;
+
+static mut DEMO_PHYS: [usize; MAX_THREADS] = [0; MAX_THREADS];
+
+extern "C" fn vm_demo_thread() -> ! {
+    let me = CURRENT.load(Ordering::Relaxed);
+
+    let page = kmalloc(4096, 4096);
+    if page.is_null() {
+        println!("[vm-demo {}] kmalloc failed", me);
+        thread_exit();
+    }
+    let paddr = page as u64;
+
+    if !thread_map_page(me, DEMO_VA, paddr) {
+        println!("[vm-demo {}] map failed", me);
+        thread_exit();
+    }
+
+    unsafe {
+        DEMO_PHYS[me] = page as usize;
+    }
+
+    let pattern: u64 = 0xAA00_0000_0000_0000u64 | ((me as u64) << 40);
+
+    unsafe {
+        let p = DEMO_VA as *mut u64;
+        core::ptr::write_volatile(p, pattern);
+    }
+
+    println!("[vm-demo {}] wrote {:#018x} to VA {:#x} (phys {:#x})",
+        me, pattern, DEMO_VA, paddr);
+
+    thread_sleep(8);
+
+    let readback = unsafe {
+        let p = DEMO_VA as *const u64;
+        core::ptr::read_volatile(p)
+    };
+
+    if readback == pattern {
+        println!("[vm-demo {}] read back {:#018x}  OK (isolation works)", me, readback);
+    } else {
+        println!("[vm-demo {}] read back {:#018x}  WRONG (expected {:#018x})",
+            me, readback, pattern);
+    }
+
+    thread_exit();
+}
+
+fn spawn_vm_demo() -> Option<usize> {
+    let slot = find_free_spawn_slot()?;
+    let stack_base = spawn_stack_base(slot)?;
+
+    // Reset this thread's private L1/L2/L3 so the demo starts clean.
+    unsafe {
+        let l1 = core::ptr::addr_of_mut!(TT_THREAD_L1[slot]) as *mut u64;
+        let l2 = core::ptr::addr_of_mut!(TT_THREAD_L2[slot]) as *mut u64;
+        let l3 = core::ptr::addr_of_mut!(TT_THREAD_L3[slot]) as *mut u64;
+        for i in 0..512 {
+            *l1.add(i) = 0;
+            *l2.add(i) = 0;
+            *l3.add(i) = 0;
+        }
+    }
+
+    unsafe {
+        CTX[slot].sp = stack_base as u64 + STACK_SIZE as u64;
+        CTX[slot].elr = vm_demo_thread as *const () as usize as u64;
+        CTX[slot].spsr = 0x5;
+        CTX[slot].wake_at = 0;
+        STATE[slot] = ThreadState::Ready;
+    }
+    Some(slot)
+}
+
+// ============================================================
 // Shell
 // ============================================================
 
@@ -823,12 +971,14 @@ fn handle_command(line: &str) {
             println!("  heap                     - heap statistics");
             println!("  ptdump                   - kernel page table dump");
             println!("  mmu                      - MMU registers");
-            println!("  tlb <idx> <vaddr> <paddr> - map vaddr→paddr for thread idx");
+            println!("  tlb <idx> <vaddr> <paddr> - map vaddr->paddr for thread idx");
             println!("  ttbr <idx>               - show thread's TTBR0");
-            println!("  vmtest                   - test virtual memory isolation");
-            println!("  halt                     - stop the CPU");
-            println!("  panic                    - trigger panic");
-            println!("  reboot                   - PSCI reset");
+            println!("  vmtest                   - setup isolation test mappings");
+            println!("  vmdemo                   - run isolation demo (2 threads, same VA)");
+            println!("  vminfo                   - show last vmdemo results");
+            println!("  halt                     - stop the CPU (kernel level)");
+            println!("  shutdown                 - power off via PSCI");
+            println!("  reboot                   - reset via PSCI");
         }
         "clear" => clear_screen(),
         "ticks" => println!("Ticks: {}", TICKS.load(Ordering::Relaxed)),
@@ -1096,7 +1246,7 @@ fn handle_command(line: &str) {
                     if thread_map_page(i as usize, va, pa) {
                         println!("Mapped thread {} vaddr {:#x} -> paddr {:#x}", i, va, pa);
                     } else {
-                        println!("tlb: mapping failed (vaddr must be 0x80_0000_0000..0x100_0000_0000)");
+                        println!("tlb: mapping failed (vaddr must be 0x8000000000..0xC000000000, L1 idx 0)");
                     }
                 }
                 _ => println!("Usage: tlb <thread_idx> <vaddr> <paddr>"),
@@ -1112,7 +1262,6 @@ fn handle_command(line: &str) {
                 let pa2 = p2 as u64;
                 println!("vmtest: allocated physical pages at {:#x} and {:#x}", pa1, pa2);
 
-                // VA in 512GB..1TB range so L0 index = 1.
                 let va: u64 = 0x80_0000_0000 + 0x10_0000;
 
                 if !thread_map_page(0, va, pa1) || !thread_map_page(1, va, pa2) {
@@ -1121,15 +1270,50 @@ fn handle_command(line: &str) {
                     println!("vmtest: mapped VA {:#x}", va);
                     println!("  thread 0 -> physical {:#x}", pa1);
                     println!("  thread 1 -> physical {:#x}", pa2);
-                    println!("Both threads now have the same VA mapped to different physical pages.");
-                    println!("(Use future 'vread' command from each thread to see isolation.)");
+                }
+            }
+        }
+        "vmdemo" => {
+            let mut spawned = 0;
+            for _ in 0..2 {
+                match spawn_vm_demo() {
+                    Some(_) => spawned += 1,
+                    None => break,
+                }
+            }
+            println!("vmdemo: spawned {} isolation threads", spawned);
+            println!("  Both write to VA {:#x} with different patterns.", DEMO_VA);
+            println!("  After a few seconds, run 'vminfo' to see results.");
+        }
+        "vminfo" => {
+            println!("VM demo results:");
+            println!("Idx  Physical");
+            println!("---  -----------------");
+            unsafe {
+                for i in 0..MAX_THREADS {
+                    if DEMO_PHYS[i] == 0 { continue; }
+                    println!("{:>3}  {:#018x}", i, DEMO_PHYS[i]);
                 }
             }
         }
         "halt" => {
-            println!("Halting...");
-            sleep_ms(100);
+            println!("Halting (CPU stopped). Use 'shutdown' to power off, or close QEMU.");
+            sleep_ms(200);
             unsafe { core::arch::asm!("msr daifset, #2", options(nostack, nomem)); }
+            loop { unsafe { core::arch::asm!("wfi", options(nostack, nomem)); } }
+        }
+        "shutdown" => {
+            println!("Shutting down via PSCI...");
+            sleep_ms(200);
+            unsafe {
+                core::arch::asm!(
+                    "movz x0, #0x0008",
+                    "movk x0, #0x8400, lsl #16",
+                    "hvc #0",
+                    out("x0") _,
+                    options(nostack, nomem)
+                );
+            }
             loop { unsafe { core::arch::asm!("wfi", options(nostack, nomem)); } }
         }
         "panic" => panic!("user-triggered panic"),
@@ -1161,8 +1345,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.9");
-    println!("   Per-Thread Page Tables");
+    println!("     AdityaOS Shell v1.10a");
+    println!("    VM Isolation Demo");
     println!("=================================");
     println!();
 
@@ -1217,6 +1401,11 @@ pub extern "C" fn rust_exception_handler(esr: u64, elr: u64, far: u64) {
     println!("  FAR_EL1: {:#018x}", far);
     let ec = (esr >> 26) & 0x3F;
     println!("  EC: {:#x}", ec);
+    // Decode DFSC for data aborts
+    if ec == 0x24 || ec == 0x25 {
+        let dfsc = esr & 0x3F;
+        println!("  DFSC: {:#x}", dfsc);
+    }
     println!("System halted.");
 }
 
@@ -1292,8 +1481,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.9\n", 3);
-    print_slow("   Per-Thread Page Tables\n", 3);
+    print_slow("       AdityaOS v1.10a\n", 3);
+    print_slow("    VM Isolation Demo\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
@@ -1312,7 +1501,6 @@ pub extern "C" fn kmain() -> ! {
     println!("Building per-thread page tables...");
     thread_page_tables_init();
     println!("  Thread 0 TTBR0 = {:#x}", tt_thread_l0_phys(0));
-    println!("  Thread 1 TTBR0 = {:#x}", tt_thread_l0_phys(1));
 
     println!("Configuring MMU registers...");
     mmu_configure();
