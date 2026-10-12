@@ -86,7 +86,7 @@ macro_rules! println {
 }
 
 // ============================================================
-// UART RX ring buffer (lock-free SPSC)
+// UART RX ring buffer
 // ============================================================
 
 const RX_BUF_SIZE: usize = 256;
@@ -186,6 +186,65 @@ pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
         i += 1;
     }
     dest
+}
+
+// ============================================================
+// Heap allocator (bump)
+// ============================================================
+
+// Heap region: after the kernel image. Chosen as a fixed address
+// inside QEMU virt RAM (which spans 0x40000000..0x50000000).
+const HEAP_START: usize = 0x4800_0000;      // 128 MB mark
+const HEAP_END:   usize = 0x4F00_0000;      // 240 MB mark
+const HEAP_SIZE:  usize = HEAP_END - HEAP_START;
+
+static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
+static HEAP_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+fn heap_init() {
+    HEAP_NEXT.store(HEAP_START, Ordering::Relaxed);
+    HEAP_ALLOCS.store(0, Ordering::Relaxed);
+}
+
+fn heap_used() -> usize {
+    let next = HEAP_NEXT.load(Ordering::Relaxed);
+    if next == 0 { 0 } else { next - HEAP_START }
+}
+
+pub fn kmalloc(size: usize, align: usize) -> *mut u8 {
+    if size == 0 { return core::ptr::null_mut(); }
+    if align == 0 { return core::ptr::null_mut(); }
+
+    // Atomic bump: get a unique aligned address
+    loop {
+        let cur = HEAP_NEXT.load(Ordering::Relaxed);
+        if cur == 0 { return core::ptr::null_mut(); }  // heap not initialized
+
+        // Align up
+        let aligned = (cur + align - 1) & !(align - 1);
+        let end = aligned + size;
+
+        if end > HEAP_END {
+            return core::ptr::null_mut();  // out of memory
+        }
+
+        // Try to reserve [aligned, end). If someone else raced us,
+        // we retry the whole loop.
+        match HEAP_NEXT.compare_exchange_weak(
+            cur, end, Ordering::AcqRel, Ordering::Relaxed)
+        {
+            Ok(_) => {
+                HEAP_ALLOCS.fetch_add(1, Ordering::Relaxed);
+                return aligned as *mut u8;
+            }
+            Err(_) => continue,
+        }
+    }
+}
+
+/// No-op for bump allocator. Present so the API is stable.
+pub fn kfree(_ptr: *mut u8) {
+    // Bump allocator does not reclaim memory.
 }
 
 // ============================================================
@@ -348,17 +407,12 @@ extern "C" {
 extern "C" fn thread_a() -> ! { loop { core::hint::spin_loop(); } }
 extern "C" fn thread_b() -> ! { loop { core::hint::spin_loop(); } }
 
-/// Cooperative sleep: mark current thread Sleeping until tick+delta.
-/// Uses WFI so the CPU actually idles until the next interrupt wakes it.
 fn thread_sleep(ticks: u64) {
     unsafe {
         let me = CURRENT.load(Ordering::Relaxed);
         CTX[me].wake_at = TICKS.load(Ordering::Relaxed) + ticks;
         STATE[me] = ThreadState::Sleeping;
     }
-
-    // Wait for the timer IRQ to fire and the scheduler to mark us Ready.
-    // WFI waits for the next interrupt without burning CPU.
     loop {
         unsafe { core::arch::asm!("wfi", options(nostack, nomem)); }
         unsafe {
@@ -373,7 +427,6 @@ fn thread_sleep(ticks: u64) {
 extern "C" fn spawned_lifecycle_thread() -> ! {
     println!("[spawned: hello]");
     for i in 1..=4 {
-        // 5 ticks = ~500ms
         thread_sleep(5);
         println!("[spawned: heartbeat {}]", i);
     }
@@ -546,24 +599,26 @@ fn handle_command(line: &str) {
     match cmd {
         "help" => {
             println!("AdityaOS shell commands:");
-            println!("  help          - show this message");
-            println!("  clear         - clear screen");
-            println!("  ticks         - show timer tick count");
-            println!("  uptime        - show seconds since boot");
-            println!("  time          - same as uptime");
-            println!("  threads       - show thread/scheduler info");
-            println!("  tasks         - show thread table with state");
-            println!("  el            - show current exception level");
-            println!("  regs          - dump CPU state");
-            println!("  irqs          - show interrupt counts");
-            println!("  echo <text>   - print text back");
-            println!("  sleep <ms>    - busy-wait sleep");
-            println!("  mem <addr>    - dump 128 bytes at hex addr");
-            println!("  history       - show command history");
-            println!("  spawn         - spawn one lifecycle thread");
-            println!("  spawnmany <n> - spawn up to N lifecycle threads");
-            println!("  panic         - trigger a kernel panic");
-            println!("  reboot        - reset the system (PSCI)");
+            println!("  help            - show this message");
+            println!("  clear           - clear screen");
+            println!("  ticks           - show timer tick count");
+            println!("  uptime          - show seconds since boot");
+            println!("  time            - same as uptime");
+            println!("  threads         - show thread/scheduler info");
+            println!("  tasks           - show thread table with state");
+            println!("  el              - show current exception level");
+            println!("  regs            - dump CPU state");
+            println!("  irqs            - show interrupt counts");
+            println!("  echo <text>     - print text back");
+            println!("  sleep <ms>      - busy-wait sleep");
+            println!("  mem <addr>      - dump 128 bytes at hex addr");
+            println!("  history         - show command history");
+            println!("  spawn           - spawn one lifecycle thread");
+            println!("  spawnmany <n>   - spawn up to N lifecycle threads");
+            println!("  alloc <size>    - allocate memory (bump)");
+            println!("  heap            - show heap statistics");
+            println!("  panic           - trigger a kernel panic");
+            println!("  reboot          - reset the system (PSCI)");
         }
         "clear" => clear_screen(),
         "ticks" => println!("Ticks: {}", TICKS.load(Ordering::Relaxed)),
@@ -662,6 +717,35 @@ fn handle_command(line: &str) {
                 println!("Usage: spawnmany <n>");
             }
         }
+        "alloc" => {
+            if let Some(size) = parse_u64(args) {
+                let size = size as usize;
+                if size == 0 || size > HEAP_SIZE {
+                    println!("alloc: size must be 1..{}", HEAP_SIZE);
+                } else {
+                    let ptr = kmalloc(size, 16);
+                    if ptr.is_null() {
+                        println!("alloc: out of memory");
+                    } else {
+                        println!("alloc: {} bytes at {:#018x}", size, ptr as usize);
+                    }
+                }
+            } else {
+                println!("Usage: alloc <bytes>");
+            }
+        }
+        "heap" => {
+            let used = heap_used();
+            let total = HEAP_SIZE;
+            let free = total - used;
+            println!("Heap start: {:#018x}", HEAP_START);
+            println!("Heap end:   {:#018x}", HEAP_END);
+            println!("Heap next:  {:#018x}", HEAP_NEXT.load(Ordering::Relaxed));
+            println!("Total:      {} bytes", total);
+            println!("Used:       {} bytes", used);
+            println!("Free:       {} bytes", free);
+            println!("Allocs:     {}", HEAP_ALLOCS.load(Ordering::Relaxed));
+        }
         "panic" => panic!("user-triggered panic"),
         "reboot" => {
             println!("Rebooting via PSCI...");
@@ -687,13 +771,12 @@ extern "C" fn shell_thread() -> ! {
     let mut buf = [0u8; MAX_LINE];
     let mut len: usize = 0;
 
-    // Wait a few ticks before printing the banner
     thread_sleep(5);
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.5");
-    println!("     Sleeping Threads");
+    println!("     AdityaOS Shell v1.6");
+    println!("     Memory Allocator");
     println!("=================================");
     println!();
 
@@ -703,7 +786,6 @@ extern "C" fn shell_thread() -> ! {
         let c = match uart_try_getc() {
             Some(b) => b,
             None => {
-                // Sleep 1 tick and try again. WFI means the CPU idles.
                 thread_sleep(1);
                 continue;
             }
@@ -763,7 +845,6 @@ pub extern "C" fn rust_irq_handler(current: *mut Context) -> *const Context {
         let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
         timer_rearm();
 
-        // Wake any Sleeping threads whose wake_at <= current tick
         unsafe {
             for i in 0..MAX_THREADS {
                 if STATE[i] == ThreadState::Sleeping && CTX[i].wake_at <= t {
@@ -819,13 +900,18 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.5\n", 3);
-    print_slow("     Sleeping Threads\n", 3);
+    print_slow("       AdityaOS v1.6\n", 3);
+    print_slow("     Memory Allocator\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
     println!("Timer frequency: {} Hz", read_cntfrq());
     println!();
+
+    println!("Initializing heap...");
+    heap_init();
+    println!("  heap: {:#x}..{:#x} ({} MB)",
+        HEAP_START, HEAP_END, HEAP_SIZE / (1024 * 1024));
 
     let mut buf: [u8; 16] = [0; 16];
     unsafe {
