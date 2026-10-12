@@ -238,10 +238,9 @@ pub fn kfree(_ptr: *mut u8) {
 }
 
 // ============================================================
-// Page tables + MMU registers (MMU still OFF)
+// Page tables + MMU
 // ============================================================
-//
-// Descriptor bits (from ARMv8-A spec, D8.3)
+
 const DESC_VALID:  u64 = 1 << 0;
 const DESC_TABLE:  u64 = 1 << 1;
 const DESC_AF:     u64 = 1 << 10;
@@ -287,15 +286,7 @@ fn tt_l0_phys() -> usize {
     TT_L0_PHYS.load(Ordering::Relaxed)
 }
 
-// ------------------------------------------------------------
-// MMU control registers
-// ------------------------------------------------------------
-
-/// MAIR_EL1: attribute index 0 = Normal WB, index 1 = Device-nGnRE
 const MAIR_VALUE: u64 = 0x0000_0000_0000_04FF;
-
-/// TCR_EL1: T0SZ=16 (48-bit VA), TG0=4KB, SH0=inner,
-///          ORGN0/IRGN0=WBWA, EPD1=1 (no TTBR1), IPS=40-bit
 const TCR_VALUE: u64 = 0x0000_0000_3080_3510;
 
 fn mmu_configure() {
@@ -304,6 +295,31 @@ fn mmu_configure() {
         core::arch::asm!("msr mair_el1, {v}", v = in(reg) MAIR_VALUE, options(nostack, nomem));
         core::arch::asm!("msr tcr_el1,  {v}", v = in(reg) TCR_VALUE,  options(nostack, nomem));
         core::arch::asm!("msr ttbr0_el1, {v}", v = in(reg) ttbr0,     options(nostack, nomem));
+        core::arch::asm!("isb", options(nostack, nomem));
+    }
+}
+
+/// Enable the MMU. Called once, at the very end of kmain.
+/// After this, every load/store goes through the identity page tables.
+fn mmu_enable() {
+    unsafe {
+        // Complete all prior memory accesses and page table writes.
+        core::arch::asm!("dsb sy",  options(nostack, nomem));
+        core::arch::asm!("isb",     options(nostack, nomem));
+
+        // Invalidate any stale TLB entries.
+        core::arch::asm!("tlbi vmalle1", options(nostack, nomem));
+        core::arch::asm!("dsb ish",       options(nostack, nomem));
+        core::arch::asm!("isb",           options(nostack, nomem));
+
+        // Read SCTLR_EL1, set M bit (bit 0), write back.
+        // Caches stay OFF (bits 2 and 12 unchanged).
+        let mut sctlr: u64;
+        core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nostack, nomem));
+        sctlr |= 1;
+        core::arch::asm!("msr sctlr_el1, {}", in(reg) sctlr, options(nostack, nomem));
+
+        // Ensure the write takes effect before any more instructions execute.
         core::arch::asm!("isb", options(nostack, nomem));
     }
 }
@@ -965,7 +981,6 @@ fn handle_command(line: &str) {
                 println!("L1[0] = {:#018x}  (maps 0x0000_0000..0x4000_0000)", l1_0);
                 println!("L1[1] = {:#018x}  (maps 0x4000_0000..0x8000_0000)", l1_1);
             }
-            println!("MMU: currently OFF");
         }
         "mmu" => {
             println!("MAIR_EL1:  {:#018x}", read_mair());
@@ -978,9 +993,6 @@ fn handle_command(line: &str) {
             } else {
                 println!("MMU: ON  (SCTLR_EL1.M = 1)");
             }
-            println!("Expected MAIR:   {:#018x}", MAIR_VALUE);
-            println!("Expected TCR:    {:#018x}", TCR_VALUE);
-            println!("Expected TTBR0:  {:#018x}", tt_l0_phys());
         }
         "halt" => {
             println!("Halting...");
@@ -1017,8 +1029,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.8b");
-    println!("   MMU Registers (MMU off)");
+    println!("     AdityaOS Shell v1.8c");
+    println!("      MMU ENABLED");
     println!("=================================");
     println!();
 
@@ -1142,8 +1154,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.8b\n", 3);
-    print_slow("   MMU Registers (MMU off)\n", 3);
+    print_slow("       AdityaOS v1.8c\n", 3);
+    print_slow("        MMU ENABLED\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
@@ -1164,9 +1176,6 @@ pub extern "C" fn kmain() -> ! {
     println!("  MAIR_EL1  = {:#018x}", read_mair());
     println!("  TCR_EL1   = {:#018x}", read_tcr());
     println!("  TTBR0_EL1 = {:#018x}", read_ttbr0());
-    println!("  SCTLR_EL1 = {:#018x}  (M bit = {})",
-        read_sctlr(), read_sctlr() & 1);
-    println!("  MMU: OFF");
 
     let mut buf: [u8; 16] = [0; 16];
     unsafe {
@@ -1191,6 +1200,12 @@ pub extern "C" fn kmain() -> ! {
     uart_enable_rx_irq();
     println!("Enabling IRQs...");
     enable_irqs();
+    println!();
+
+    // ---- The moment of truth ----
+    println!("Enabling MMU...");
+    mmu_enable();
+    println!("MMU enabled! SCTLR_EL1 = {:#018x}", read_sctlr());
     println!();
 
     unsafe {
