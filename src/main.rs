@@ -3,7 +3,40 @@
 
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+// ============================================================
+// Spinlock (defined, but not yet used anywhere)
+// ============================================================
+
+pub struct SpinLock {
+    locked: AtomicBool,
+}
+
+impl SpinLock {
+    pub const fn new() -> Self {
+        Self { locked: AtomicBool::new(false) }
+    }
+
+    pub fn lock(&self) {
+        unsafe { core::arch::asm!("msr daifset, #2", options(nostack, nomem)); }
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    pub fn unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+        unsafe { core::arch::asm!("msr daifclr, #2", options(nostack, nomem)); }
+    }
+}
+
+#[allow(dead_code)]
+static UART_LOCK: SpinLock = SpinLock::new();
 
 // ============================================================
 // UART
@@ -217,7 +250,7 @@ pub struct Context {
 }
 
 const STACK_SIZE: usize = 16 * 1024;
-const NUM_THREADS: usize = 4; // 3 static + 1 slot for spawn
+const NUM_THREADS: usize = 4;
 
 #[repr(align(16))]
 struct Stack([u8; STACK_SIZE]);
@@ -246,7 +279,6 @@ extern "C" {
 extern "C" fn thread_a() -> ! { loop { core::hint::spin_loop(); } }
 extern "C" fn thread_b() -> ! { loop { core::hint::spin_loop(); } }
 
-/// A thread that runs, prints heartbeats, then exits.
 extern "C" fn spawned_lifecycle_thread() -> ! {
     println!("[thread started: will run for ~2s]");
     for i in 1..=4 {
@@ -257,8 +289,6 @@ extern "C" fn spawned_lifecycle_thread() -> ! {
     thread_exit();
 }
 
-/// Mark the current thread as Dead and yield forever.
-/// The scheduler skips Dead threads, so the loop below never runs again.
 pub fn thread_exit() -> ! {
     unsafe {
         let me = CURRENT.load(Ordering::Relaxed);
@@ -284,12 +314,9 @@ pub fn sched_init() {
         CTX[2].elr = shell_thread as *const () as usize as u64;
         CTX[2].spsr = 0x5;
         STATE[2] = ThreadState::Ready;
-
-        // Slot 3 is Unused — will be used by spawn
     }
 }
 
-/// Spawn a lifecycle thread in slot 3. Returns None if slot 3 is not Unused or Dead.
 fn spawn_lifecycle() -> Option<usize> {
     const SLOT: usize = 3;
     unsafe {
@@ -504,7 +531,7 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.2");
+    println!("     AdityaOS Shell v1.2a");
     println!("    Thread Lifecycle");
     println!("=================================");
     println!();
@@ -572,13 +599,11 @@ pub extern "C" fn rust_irq_handler(current: *mut Context) -> *const Context {
 
             let cur = CURRENT.load(Ordering::Relaxed);
             unsafe {
-                // If the running thread is Dead, don't mark it Ready.
                 if STATE[cur] == ThreadState::Running {
                     STATE[cur] = ThreadState::Ready;
                 }
             }
 
-            // Find next thread that is Ready or Running, skipping Dead and Unused.
             let mut nxt = cur;
             unsafe {
                 for step in 1..=NUM_THREADS {
@@ -616,8 +641,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.2\n", 3);
-    print_slow("    Thread Lifecycle\n", 3);
+    print_slow("       AdityaOS v1.2a\n", 3);
+    print_slow("    Lock Type Defined\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
