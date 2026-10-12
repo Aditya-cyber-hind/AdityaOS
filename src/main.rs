@@ -6,7 +6,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 // ============================================================
-// Spinlock (still unused; the RX ring buffer is lock-free)
+// Spinlock (defined, still unused)
 // ============================================================
 
 pub struct SpinLock {
@@ -43,15 +43,15 @@ static UART_LOCK: SpinLock = SpinLock::new();
 // ============================================================
 
 const UART0_BASE: usize = 0x0900_0000;
-const UART0_DR:   usize = UART0_BASE + 0x00;  // Data register
-const UART0_FR:   usize = UART0_BASE + 0x18;  // Flag register
-const UART0_IMSC: usize = UART0_BASE + 0x38;  // Interrupt mask set/clear
-const UART0_ICR:  usize = UART0_BASE + 0x44;  // Interrupt clear register
-const UART0_CR:   usize = UART0_BASE + 0x30;  // Control register
+const UART0_DR:   usize = UART0_BASE + 0x00;
+const UART0_FR:   usize = UART0_BASE + 0x18;
+const UART0_IMSC: usize = UART0_BASE + 0x38;
+const UART0_ICR:  usize = UART0_BASE + 0x44;
+const UART0_CR:   usize = UART0_BASE + 0x30;
 
 const UART0_TXFF: u32   = 1 << 5;
 const UART0_RXFE: u32   = 1 << 4;
-const UART0_RXIM: u32   = 1 << 4;  // RX interrupt mask bit
+const UART0_RXIM: u32   = 1 << 4;
 
 pub struct Uart;
 
@@ -92,32 +92,22 @@ macro_rules! println {
 const RX_BUF_SIZE: usize = 256;
 
 static mut RX_BUF: [u8; RX_BUF_SIZE] = [0; RX_BUF_SIZE];
-static RX_HEAD: AtomicUsize = AtomicUsize::new(0); // written by IRQ handler
-static RX_TAIL: AtomicUsize = AtomicUsize::new(0); // written by consumer
+static RX_HEAD: AtomicUsize = AtomicUsize::new(0);
+static RX_TAIL: AtomicUsize = AtomicUsize::new(0);
 
-/// Called from IRQ handler when a byte arrives.
-/// Only the IRQ handler ever calls this.
 fn rx_push(byte: u8) {
     let head = RX_HEAD.load(Ordering::Relaxed);
     let tail = RX_TAIL.load(Ordering::Acquire);
     let next = (head + 1) % RX_BUF_SIZE;
-    if next == tail {
-        // Buffer full — drop the byte
-        return;
-    }
-    unsafe {
-        RX_BUF[head] = byte;
-    }
+    if next == tail { return; }
+    unsafe { RX_BUF[head] = byte; }
     RX_HEAD.store(next, Ordering::Release);
 }
 
-/// Called by the shell. Returns Some(byte) if available, None otherwise.
 fn uart_try_getc() -> Option<u8> {
     let tail = RX_TAIL.load(Ordering::Relaxed);
     let head = RX_HEAD.load(Ordering::Acquire);
-    if tail == head {
-        return None;
-    }
+    if tail == head { return None; }
     let byte = unsafe { RX_BUF[tail] };
     RX_TAIL.store((tail + 1) % RX_BUF_SIZE, Ordering::Release);
     Some(byte)
@@ -213,8 +203,8 @@ const GICD_BASE: usize = 0x0800_0000;
 const GICC_BASE: usize = 0x0801_0000;
 
 const GICD_CTLR:       usize = GICD_BASE + 0x000;
-const GICD_ISENABLER0: usize = GICD_BASE + 0x100;   // SGIs and PPIs (0..31)
-const GICD_ISENABLER1: usize = GICD_BASE + 0x104;   // SPIs (32..63)
+const GICD_ISENABLER0: usize = GICD_BASE + 0x100;
+const GICD_ISENABLER1: usize = GICD_BASE + 0x104;
 const GICD_IPRIORITYR: usize = GICD_BASE + 0x400;
 const GICD_ITARGETSR:  usize = GICD_BASE + 0x800;
 
@@ -224,28 +214,20 @@ const GICC_IAR:  usize = GICC_BASE + 0x00C;
 const GICC_EOIR: usize = GICC_BASE + 0x010;
 
 const IRQ_CNTPNS: u32 = 30;
-const IRQ_UART0:  u32 = 33;  // PL011 UART0 on QEMU virt
+const IRQ_UART0:  u32 = 33;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static UART_IRQS: AtomicU64 = AtomicU64::new(0);
 
 fn gic_enable_irq(id: u32) {
     if id < 32 {
-        // SGI or PPI — set bit in ISENABLER0
         mmio_write32(GICD_ISENABLER0, 1u32 << id);
     } else {
-        // SPI — set bit in ISENABLER1 at position (id - 32)
         mmio_write32(GICD_ISENABLER1, 1u32 << (id - 32));
     }
-
-    // Priority (byte per IRQ)
     unsafe {
         let pri = (GICD_IPRIORITYR + id as usize) as *mut u8;
         core::ptr::write_volatile(pri, 0x80);
-    }
-
-    // Target CPU 0
-    unsafe {
         let tgt = (GICD_ITARGETSR + id as usize) as *mut u8;
         core::ptr::write_volatile(tgt, 0x01);
     }
@@ -255,7 +237,6 @@ fn gic_init() {
     mmio_write32(GICD_CTLR, 1);
     mmio_write32(GICC_PMR, 0xFF);
     mmio_write32(GICC_CTLR, 1);
-
     gic_enable_irq(IRQ_CNTPNS);
     gic_enable_irq(IRQ_UART0);
 }
@@ -281,40 +262,21 @@ fn timer_rearm() {
     }
 }
 
-/// Enable UART RX interrupts. Also enables the UART itself.
 fn uart_enable_rx_irq() {
-    unsafe {
-        // Disable UART while configuring
-        mmio_write32(UART0_CR, 0);
-
-        // Clear any pending interrupts
-        mmio_write32(UART0_ICR, 0x7FF);
-
-        // Enable RX interrupt in the mask register
-        mmio_write32(UART0_IMSC, UART0_RXIM);
-
-        // Enable UART: UARTEN | TXE | RXE
-        //   UARTEN = bit 0, TXE = bit 8, RXE = bit 9
-        mmio_write32(UART0_CR, (1 << 0) | (1 << 8) | (1 << 9));
-    }
+    mmio_write32(UART0_CR, 0);
+    mmio_write32(UART0_ICR, 0x7FF);
+    mmio_write32(UART0_IMSC, UART0_RXIM);
+    mmio_write32(UART0_CR, (1 << 0) | (1 << 8) | (1 << 9));
 }
 
-/// Handle a UART interrupt. Called from the IRQ handler.
 fn uart_handle_irq() {
     UART_IRQS.fetch_add(1, Ordering::Relaxed);
-
-    // Drain the RX FIFO — read until no more data
     loop {
         let fr = mmio_read32(UART0_FR);
-        if (fr & UART0_RXFE) != 0 {
-            break;
-        }
+        if (fr & UART0_RXFE) != 0 { break; }
         let dr = mmio_read32(UART0_DR);
-        let byte = (dr & 0xFF) as u8;
-        rx_push(byte);
+        rx_push((dr & 0xFF) as u8);
     }
-
-    // Clear RX interrupt
     mmio_write32(UART0_ICR, UART0_RXIM);
 }
 
@@ -331,6 +293,7 @@ pub enum ThreadState {
     Unused,
     Ready,
     Running,
+    Sleeping,
     Dead,
 }
 
@@ -340,6 +303,7 @@ pub struct Context {
     pub sp: u64,
     pub elr: u64,
     pub spsr: u64,
+    pub wake_at: u64,
 }
 
 const STACK_SIZE: usize = 16 * 1024;
@@ -362,14 +326,14 @@ static STACK_S4: Stack = Stack([0; STACK_SIZE]);
 static STACK_S5: Stack = Stack([0; STACK_SIZE]);
 
 static mut CTX: [Context; MAX_THREADS] = [
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
 ];
 
 static mut STATE: [ThreadState; MAX_THREADS] = [ThreadState::Unused; MAX_THREADS];
@@ -384,10 +348,33 @@ extern "C" {
 extern "C" fn thread_a() -> ! { loop { core::hint::spin_loop(); } }
 extern "C" fn thread_b() -> ! { loop { core::hint::spin_loop(); } }
 
+/// Cooperative sleep: mark current thread Sleeping until tick+delta.
+/// Uses WFI so the CPU actually idles until the next interrupt wakes it.
+fn thread_sleep(ticks: u64) {
+    unsafe {
+        let me = CURRENT.load(Ordering::Relaxed);
+        CTX[me].wake_at = TICKS.load(Ordering::Relaxed) + ticks;
+        STATE[me] = ThreadState::Sleeping;
+    }
+
+    // Wait for the timer IRQ to fire and the scheduler to mark us Ready.
+    // WFI waits for the next interrupt without burning CPU.
+    loop {
+        unsafe { core::arch::asm!("wfi", options(nostack, nomem)); }
+        unsafe {
+            let me = CURRENT.load(Ordering::Relaxed);
+            if STATE[me] != ThreadState::Sleeping {
+                break;
+            }
+        }
+    }
+}
+
 extern "C" fn spawned_lifecycle_thread() -> ! {
     println!("[spawned: hello]");
     for i in 1..=4 {
-        sleep_ms(500);
+        // 5 ticks = ~500ms
+        thread_sleep(5);
         println!("[spawned: heartbeat {}]", i);
     }
     println!("[spawned: exiting]");
@@ -436,14 +423,10 @@ fn spawn_stack_base(slot: usize) -> Option<usize> {
 fn find_free_spawn_slot() -> Option<usize> {
     unsafe {
         for i in FIRST_SPAWN_SLOT..MAX_THREADS {
-            if STATE[i] == ThreadState::Dead {
-                return Some(i);
-            }
+            if STATE[i] == ThreadState::Dead { return Some(i); }
         }
         for i in FIRST_SPAWN_SLOT..MAX_THREADS {
-            if STATE[i] == ThreadState::Unused {
-                return Some(i);
-            }
+            if STATE[i] == ThreadState::Unused { return Some(i); }
         }
     }
     None
@@ -461,6 +444,7 @@ fn spawn_lifecycle_in_slot(slot: usize) -> bool {
         CTX[slot].sp = stack_base as u64 + STACK_SIZE as u64;
         CTX[slot].elr = spawned_lifecycle_thread as *const () as usize as u64;
         CTX[slot].spsr = 0x5;
+        CTX[slot].wake_at = 0;
         STATE[slot] = ThreadState::Ready;
     }
     true
@@ -545,6 +529,7 @@ fn state_name(s: ThreadState) -> &'static str {
         ThreadState::Unused => "unused",
         ThreadState::Ready => "ready",
         ThreadState::Running => "running",
+        ThreadState::Sleeping => "sleep",
         ThreadState::Dead => "dead",
     }
 }
@@ -572,7 +557,7 @@ fn handle_command(line: &str) {
             println!("  regs          - dump CPU state");
             println!("  irqs          - show interrupt counts");
             println!("  echo <text>   - print text back");
-            println!("  sleep <ms>    - sleep for N milliseconds");
+            println!("  sleep <ms>    - busy-wait sleep");
             println!("  mem <addr>    - dump 128 bytes at hex addr");
             println!("  history       - show command history");
             println!("  spawn         - spawn one lifecycle thread");
@@ -589,29 +574,32 @@ fn handle_command(line: &str) {
         "threads" => {
             let mut live = 0;
             let mut dead = 0;
+            let mut sleeping = 0;
             unsafe {
                 for i in 0..MAX_THREADS {
                     match STATE[i] {
                         ThreadState::Unused => {}
                         ThreadState::Dead => dead += 1,
+                        ThreadState::Sleeping => sleeping += 1,
                         _ => live += 1,
                     }
                 }
             }
             println!("Live threads: {}", live);
+            println!("Sleeping: {}", sleeping);
             println!("Dead threads: {}", dead);
             println!("Current: {}", CURRENT.load(Ordering::Relaxed));
             println!("Switches: {}", SWITCHES.load(Ordering::Relaxed));
         }
         "tasks" => {
-            println!("Idx  State    SP                 ELR");
-            println!("---  -------  -----------------  -----------------");
+            println!("Idx  State    WakeAt             SP                 ELR");
+            println!("---  -------  -----------------  -----------------  -----------------");
             unsafe {
                 for i in 0..MAX_THREADS {
                     let s = STATE[i];
                     if s == ThreadState::Unused { continue; }
-                    println!("{:>3}  {:<7}  {:#018x}  {:#018x}",
-                        i, state_name(s), CTX[i].sp, CTX[i].elr);
+                    println!("{:>3}  {:<7}  {:<17}  {:#018x}  {:#018x}",
+                        i, state_name(s), CTX[i].wake_at, CTX[i].sp, CTX[i].elr);
                 }
             }
         }
@@ -699,23 +687,24 @@ extern "C" fn shell_thread() -> ! {
     let mut buf = [0u8; MAX_LINE];
     let mut len: usize = 0;
 
-    sleep_ms(500);
+    // Wait a few ticks before printing the banner
+    thread_sleep(5);
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.4");
-    println!("    UART RX Interrupts");
+    println!("     AdityaOS Shell v1.5");
+    println!("     Sleeping Threads");
     println!("=================================");
     println!();
 
     shell_prompt();
 
     loop {
-        // Non-blocking read. If no byte, yield to the scheduler.
         let c = match uart_try_getc() {
             Some(b) => b,
             None => {
-                sleep_ms(5);
+                // Sleep 1 tick and try again. WFI means the CPU idles.
+                thread_sleep(1);
                 continue;
             }
         };
@@ -774,6 +763,15 @@ pub extern "C" fn rust_irq_handler(current: *mut Context) -> *const Context {
         let t = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
         timer_rearm();
 
+        // Wake any Sleeping threads whose wake_at <= current tick
+        unsafe {
+            for i in 0..MAX_THREADS {
+                if STATE[i] == ThreadState::Sleeping && CTX[i].wake_at <= t {
+                    STATE[i] = ThreadState::Ready;
+                }
+            }
+        }
+
         if (t % 2) == 0 {
             SWITCHES.fetch_add(1, Ordering::Relaxed);
             let cur = CURRENT.load(Ordering::Relaxed);
@@ -821,8 +819,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.4\n", 3);
-    print_slow("    UART RX Interrupts\n", 3);
+    print_slow("       AdityaOS v1.5\n", 3);
+    print_slow("     Sleeping Threads\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
