@@ -78,6 +78,24 @@ fn current_el() -> u64 {
     (v >> 2) & 0x3
 }
 
+fn read_sp() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) v, options(nostack, nomem)); }
+    v
+}
+
+fn read_elr() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, elr_el1", out(reg) v, options(nostack, nomem)); }
+    v
+}
+
+fn read_spsr() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, spsr_el1", out(reg) v, options(nostack, nomem)); }
+    v
+}
+
 fn sleep_ms(ms: u64) {
     let freq = read_cntfrq();
     let ticks = (freq / 1000) * ms;
@@ -237,6 +255,24 @@ pub fn sched_init() {
 // ============================================================
 
 const MAX_LINE: usize = 128;
+const HISTORY_SIZE: usize = 8;
+
+static mut HISTORY: [[u8; MAX_LINE]; HISTORY_SIZE] = [[0; MAX_LINE]; HISTORY_SIZE];
+static HISTORY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn history_push(line: &str) {
+    let idx = HISTORY_COUNT.load(Ordering::Relaxed) % HISTORY_SIZE;
+    unsafe {
+        let slot = &mut HISTORY[idx];
+        let bytes = line.as_bytes();
+        let n = bytes.len().min(MAX_LINE - 1);
+        for i in 0..n {
+            slot[i] = bytes[i];
+        }
+        slot[n] = 0;
+    }
+    HISTORY_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 fn shell_prompt() { print!("adityaos> "); }
 
@@ -244,9 +280,38 @@ fn parse_u64(s: &str) -> Option<u64> {
     s.parse::<u64>().ok()
 }
 
+fn parse_hex(s: &str) -> Option<u64> {
+    let s = s.trim_start_matches("0x").trim_start_matches("0X");
+    u64::from_str_radix(s, 16).ok()
+}
+
+fn dump_hex_ascii(addr: u64, len: usize) {
+    println!("Dump at {:#x}, {} bytes:", addr, len);
+    let mut offset = 0;
+    while offset < len {
+        print!("{:#010x}: ", addr + offset as u64);
+        let mut ascii = [b'.'; 16];
+        let mut i = 0;
+        while i < 16 && offset + i < len {
+            let byte = unsafe { core::ptr::read_volatile((addr + (offset + i) as u64) as *const u8) };
+            print!("{:02x} ", byte);
+            ascii[i] = if byte >= 0x20 && byte <= 0x7E { byte } else { b'.' };
+            i += 1;
+        }
+        while i < 16 { print!("   "); i += 1; }
+        print!(" |");
+        for j in 0..16 {
+            if offset + j < len { Uart.putc(ascii[j]); } else { Uart.putc(b' '); }
+        }
+        println!("|");
+        offset += 16;
+    }
+}
+
 fn handle_command(line: &str) {
     let trimmed = line.trim();
     if trimmed.is_empty() { return; }
+    history_push(trimmed);
 
     let mut parts = trimmed.splitn(2, ' ');
     let cmd = parts.next().unwrap_or("");
@@ -259,16 +324,21 @@ fn handle_command(line: &str) {
             println!("  clear        - clear screen");
             println!("  ticks        - show timer tick count");
             println!("  uptime       - show seconds since boot");
+            println!("  time         - same as uptime");
             println!("  threads      - show thread/scheduler info");
+            println!("  tasks        - show thread table");
             println!("  el           - show current exception level");
+            println!("  regs         - dump CPU state");
             println!("  echo <text>  - print text back");
             println!("  sleep <ms>   - sleep for N milliseconds");
+            println!("  mem <addr>   - dump 128 bytes at hex addr");
+            println!("  history      - show command history");
             println!("  panic        - trigger a kernel panic");
             println!("  reboot       - reset the system (PSCI)");
         }
         "clear" => clear_screen(),
         "ticks" => println!("Ticks: {}", TICKS.load(Ordering::Relaxed)),
-        "uptime" => {
+        "uptime" | "time" => {
             let secs = read_cntpct() / read_cntfrq();
             println!("Uptime: {} seconds", secs);
         }
@@ -277,7 +347,22 @@ fn handle_command(line: &str) {
             println!("Current: {}", CURRENT.load(Ordering::Relaxed));
             println!("Switches: {}", SWITCHES.load(Ordering::Relaxed));
         }
+        "tasks" => {
+            println!("Idx  SP                 ELR");
+            println!("---  -----------------  -----------------");
+            unsafe {
+                for i in 0..NUM_THREADS {
+                    println!("{:>3}  {:#018x}  {:#018x}", i, CTX[i].sp, CTX[i].elr);
+                }
+            }
+        }
         "el" => println!("CurrentEL: EL{}", current_el()),
+        "regs" => {
+            println!("SP:        {:#018x}", read_sp());
+            println!("ELR_EL1:   {:#018x}", read_elr());
+            println!("SPSR_EL1:  {:#018x}", read_spsr());
+            println!("CurrentEL: EL{}", current_el());
+        }
         "echo" => println!("{}", args),
         "sleep" => {
             if let Some(ms) = parse_u64(args) {
@@ -286,6 +371,29 @@ fn handle_command(line: &str) {
                 println!("Awake.");
             } else {
                 println!("Usage: sleep <ms>");
+            }
+        }
+        "mem" => {
+            if let Some(addr) = parse_hex(args) {
+                dump_hex_ascii(addr, 128);
+            } else {
+                println!("Usage: mem <hex address>  e.g. mem 0x40080000");
+            }
+        }
+        "history" => {
+            let total = HISTORY_COUNT.load(Ordering::Relaxed);
+            let count = total.min(HISTORY_SIZE);
+            println!("Last {} commands:", count);
+            let start = if total > HISTORY_SIZE { total - HISTORY_SIZE } else { 0 };
+            for i in 0..count {
+                let idx = (start + i) % HISTORY_SIZE;
+                let s = unsafe {
+                    let bytes = &HISTORY[idx];
+                    let mut end = 0;
+                    while end < MAX_LINE && bytes[end] != 0 { end += 1; }
+                    core::str::from_utf8_unchecked(&bytes[..end])
+                };
+                println!("  {}", s);
             }
         }
         "panic" => panic!("user-triggered panic"),
@@ -317,8 +425,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.0");
-    println!("   Type 'help' for commands.");
+    println!("     AdityaOS Shell v1.1");
+    println!("    Shell Extensions");
     println!("=================================");
     println!();
 
@@ -412,8 +520,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.0\n", 3);
-    print_slow("      Audit Baseline\n", 3);
+    print_slow("       AdityaOS v1.1\n", 3);
+    print_slow("    Shell Extensions\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
