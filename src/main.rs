@@ -200,6 +200,14 @@ fn enable_irqs() {
 // Context / scheduler
 // ============================================================
 
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum ThreadState {
+    Unused,
+    Ready,
+    Running,
+    Dead,
+}
+
 #[repr(C)]
 pub struct Context {
     pub x: [u64; 31],
@@ -209,7 +217,7 @@ pub struct Context {
 }
 
 const STACK_SIZE: usize = 16 * 1024;
-const NUM_THREADS: usize = 3;
+const NUM_THREADS: usize = 4; // 3 static + 1 slot for spawn
 
 #[repr(align(16))]
 struct Stack([u8; STACK_SIZE]);
@@ -217,12 +225,16 @@ struct Stack([u8; STACK_SIZE]);
 static STACK_A: Stack = Stack([0; STACK_SIZE]);
 static STACK_B: Stack = Stack([0; STACK_SIZE]);
 static STACK_SHELL: Stack = Stack([0; STACK_SIZE]);
+static STACK_SPAWN: Stack = Stack([0; STACK_SIZE]);
 
 static mut CTX: [Context; NUM_THREADS] = [
     Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
     Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
     Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
 ];
+
+static mut STATE: [ThreadState; NUM_THREADS] = [ThreadState::Unused; NUM_THREADS];
 
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
@@ -234,20 +246,62 @@ extern "C" {
 extern "C" fn thread_a() -> ! { loop { core::hint::spin_loop(); } }
 extern "C" fn thread_b() -> ! { loop { core::hint::spin_loop(); } }
 
+/// A thread that runs, prints heartbeats, then exits.
+extern "C" fn spawned_lifecycle_thread() -> ! {
+    println!("[thread started: will run for ~2s]");
+    for i in 1..=4 {
+        sleep_ms(500);
+        println!("[thread heartbeat {}]", i);
+    }
+    println!("[thread exiting]");
+    thread_exit();
+}
+
+/// Mark the current thread as Dead and yield forever.
+/// The scheduler skips Dead threads, so the loop below never runs again.
+pub fn thread_exit() -> ! {
+    unsafe {
+        let me = CURRENT.load(Ordering::Relaxed);
+        STATE[me] = ThreadState::Dead;
+    }
+    println!("[thread_exit: marked dead, yielding]");
+    loop { core::hint::spin_loop(); }
+}
+
 pub fn sched_init() {
     unsafe {
         CTX[0].sp = STACK_A.0.as_ptr().add(STACK_SIZE) as u64;
         CTX[0].elr = thread_a as *const () as usize as u64;
         CTX[0].spsr = 0x5;
+        STATE[0] = ThreadState::Ready;
 
         CTX[1].sp = STACK_B.0.as_ptr().add(STACK_SIZE) as u64;
         CTX[1].elr = thread_b as *const () as usize as u64;
         CTX[1].spsr = 0x5;
+        STATE[1] = ThreadState::Ready;
 
         CTX[2].sp = STACK_SHELL.0.as_ptr().add(STACK_SIZE) as u64;
         CTX[2].elr = shell_thread as *const () as usize as u64;
         CTX[2].spsr = 0x5;
+        STATE[2] = ThreadState::Ready;
+
+        // Slot 3 is Unused — will be used by spawn
     }
+}
+
+/// Spawn a lifecycle thread in slot 3. Returns None if slot 3 is not Unused or Dead.
+fn spawn_lifecycle() -> Option<usize> {
+    const SLOT: usize = 3;
+    unsafe {
+        if STATE[SLOT] != ThreadState::Unused && STATE[SLOT] != ThreadState::Dead {
+            return None;
+        }
+        CTX[SLOT].sp = STACK_SPAWN.0.as_ptr().add(STACK_SIZE) as u64;
+        CTX[SLOT].elr = spawned_lifecycle_thread as *const () as usize as u64;
+        CTX[SLOT].spsr = 0x5;
+        STATE[SLOT] = ThreadState::Ready;
+    }
+    Some(SLOT)
 }
 
 // ============================================================
@@ -308,6 +362,15 @@ fn dump_hex_ascii(addr: u64, len: usize) {
     }
 }
 
+fn state_name(s: ThreadState) -> &'static str {
+    match s {
+        ThreadState::Unused => "unused",
+        ThreadState::Ready => "ready",
+        ThreadState::Running => "running",
+        ThreadState::Dead => "dead",
+    }
+}
+
 fn handle_command(line: &str) {
     let trimmed = line.trim();
     if trimmed.is_empty() { return; }
@@ -326,13 +389,14 @@ fn handle_command(line: &str) {
             println!("  uptime       - show seconds since boot");
             println!("  time         - same as uptime");
             println!("  threads      - show thread/scheduler info");
-            println!("  tasks        - show thread table");
+            println!("  tasks        - show thread table with state");
             println!("  el           - show current exception level");
             println!("  regs         - dump CPU state");
             println!("  echo <text>  - print text back");
             println!("  sleep <ms>   - sleep for N milliseconds");
             println!("  mem <addr>   - dump 128 bytes at hex addr");
             println!("  history      - show command history");
+            println!("  spawn        - spawn a lifecycle thread (~2s, then exits)");
             println!("  panic        - trigger a kernel panic");
             println!("  reboot       - reset the system (PSCI)");
         }
@@ -343,16 +407,25 @@ fn handle_command(line: &str) {
             println!("Uptime: {} seconds", secs);
         }
         "threads" => {
-            println!("Threads: {}", NUM_THREADS);
+            let mut live = 0;
+            unsafe {
+                for i in 0..NUM_THREADS {
+                    if STATE[i] != ThreadState::Unused { live += 1; }
+                }
+            }
+            println!("Threads live: {}", live);
             println!("Current: {}", CURRENT.load(Ordering::Relaxed));
             println!("Switches: {}", SWITCHES.load(Ordering::Relaxed));
         }
         "tasks" => {
-            println!("Idx  SP                 ELR");
-            println!("---  -----------------  -----------------");
+            println!("Idx  State    SP                 ELR");
+            println!("---  -------  -----------------  -----------------");
             unsafe {
                 for i in 0..NUM_THREADS {
-                    println!("{:>3}  {:#018x}  {:#018x}", i, CTX[i].sp, CTX[i].elr);
+                    let s = STATE[i];
+                    if s == ThreadState::Unused { continue; }
+                    println!("{:>3}  {:<7}  {:#018x}  {:#018x}",
+                        i, state_name(s), CTX[i].sp, CTX[i].elr);
                 }
             }
         }
@@ -396,6 +469,12 @@ fn handle_command(line: &str) {
                 println!("  {}", s);
             }
         }
+        "spawn" => {
+            match spawn_lifecycle() {
+                Some(idx) => println!("Spawned lifecycle thread in slot {}", idx),
+                None => println!("Spawn slot busy (thread alive or not yet reaped)."),
+            }
+        }
         "panic" => panic!("user-triggered panic"),
         "reboot" => {
             println!("Rebooting via PSCI...");
@@ -425,8 +504,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.1");
-    println!("    Shell Extensions");
+    println!("     AdityaOS Shell v1.2");
+    println!("    Thread Lifecycle");
     println!("=================================");
     println!();
 
@@ -490,12 +569,29 @@ pub extern "C" fn rust_irq_handler(current: *mut Context) -> *const Context {
 
         if (t % 2) == 0 {
             SWITCHES.fetch_add(1, Ordering::Relaxed);
+
             let cur = CURRENT.load(Ordering::Relaxed);
-            let nxt = (cur + 1) % NUM_THREADS;
-            CURRENT.store(nxt, Ordering::Relaxed);
             unsafe {
+                // If the running thread is Dead, don't mark it Ready.
+                if STATE[cur] == ThreadState::Running {
+                    STATE[cur] = ThreadState::Ready;
+                }
+            }
+
+            // Find next thread that is Ready or Running, skipping Dead and Unused.
+            let mut nxt = cur;
+            unsafe {
+                for step in 1..=NUM_THREADS {
+                    let cand = (cur + step) % NUM_THREADS;
+                    if STATE[cand] == ThreadState::Ready || STATE[cand] == ThreadState::Running {
+                        nxt = cand;
+                        break;
+                    }
+                }
+                STATE[nxt] = ThreadState::Running;
                 next = &CTX[nxt] as *const Context;
             }
+            CURRENT.store(nxt, Ordering::Relaxed);
         }
     }
 
@@ -520,8 +616,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.1\n", 3);
-    print_slow("    Shell Extensions\n", 3);
+    print_slow("       AdityaOS v1.2\n", 3);
+    print_slow("    Thread Lifecycle\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
@@ -552,6 +648,7 @@ pub extern "C" fn kmain() -> ! {
     println!();
 
     unsafe {
+        STATE[0] = ThreadState::Running;
         start_first(&CTX[0] as *const Context);
     }
 }
