@@ -444,21 +444,13 @@ fn read_sctlr() -> u64 {
 // ============================================================
 // RAM filesystem
 // ============================================================
-//
-// Flat Unix-like layout:
-//   - Fixed table of inodes (max 32)
-//   - Each inode: name, size, type, up to 4 direct data blocks
-//   - Fixed pool of data blocks (max 64), each 512 bytes
-//
-// Everything is in BSS. No heap involved. No disk. Real filesystem
-// semantics, minimal implementation.
 
 const FS_BLOCK_SIZE: usize = 512;
 const FS_MAX_BLOCKS: usize = 64;
 const FS_MAX_FILES: usize = 32;
 const FS_MAX_NAME: usize = 32;
 const FS_MAX_BLOCKS_PER_FILE: usize = 4;
-const FS_MAGIC: u32 = 0x4164_4F53; // "AdOS"
+const FS_MAGIC: u32 = 0x4164_4F53;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum FsNodeType {
@@ -633,7 +625,6 @@ fn fs_write(idx: usize, data: &[u8]) -> Result<usize, &'static str> {
             return Err("file too large (max 4 blocks = 2KB)");
         }
 
-        // Free old blocks (simplistic: just clear the inode's block list)
         FS.inodes[idx].block_count = 0;
 
         let mut remaining = data.len();
@@ -703,13 +694,6 @@ fn fs_delete(name: &str) -> Result<(), &'static str> {
         FS.inodes[idx].block_count = 0;
     }
     Ok(())
-}
-
-fn fs_file_size(name: &str) -> Option<usize> {
-    match fs_find(name) {
-        Some(i) => unsafe { Some(FS.inodes[i].size) },
-        None => None,
-    }
 }
 
 fn fs_count_files() -> usize {
@@ -1108,6 +1092,39 @@ fn history_push(line: &str) {
 
 fn shell_prompt() { print!("adityaos> "); }
 
+/// Redraw the current input line: carriage return, clear line, prompt, buffer.
+/// Also positions cursor at `cursor` position if `cursor < len`.
+fn redraw_line(buf: &[u8], len: usize, cursor: usize) {
+    print!("\r\x1b[2K");
+    print!("adityaos> ");
+    let mut i = 0;
+    while i < len {
+        Uart.putc(buf[i]);
+        i += 1;
+    }
+    // If cursor is not at the end, move back
+    if cursor < len {
+        let back = len - cursor;
+        let mut j = 0;
+        while j < back {
+            print!("\x1b[D");
+            j += 1;
+        }
+    }
+}
+
+/// Get the Nth-from-end history entry. `offset` = 0 means most recent.
+/// Returns the entry as a slice reference into the global HISTORY array.
+unsafe fn history_get(offset: usize) -> Option<&'static [u8]> {
+    let total = HISTORY_COUNT.load(Ordering::Relaxed);
+    if offset >= total.min(HISTORY_SIZE) { return None; }
+    let idx = (total - 1 - offset) % HISTORY_SIZE;
+    let slot = &HISTORY[idx];
+    let mut end = 0;
+    while end < MAX_LINE && slot[end] != 0 { end += 1; }
+    Some(&slot[..end])
+}
+
 fn parse_u64(s: &str) -> Option<u64> {
     s.parse::<u64>().ok()
 }
@@ -1223,6 +1240,13 @@ fn handle_command(line: &str) {
             println!("  rm <name>                - delete file");
             println!("  stat <name>              - file info");
             println!("  fsinfo                   - filesystem statistics");
+            println!("  === terminal shortcuts ===");
+            println!("  Up/Down                  - history navigation");
+            println!("  Ctrl+A / Ctrl+E          - move cursor to start/end");
+            println!("  Ctrl+U                   - clear line");
+            println!("  Ctrl+W                   - delete last word");
+            println!("  Ctrl+L                   - clear screen");
+            println!("  Ctrl+C                   - cancel line");
             println!("  === misc ===");
             println!("  echo <text>              - print text");
             println!("  sleep <ms>               - busy-wait sleep");
@@ -1549,7 +1573,6 @@ fn handle_command(line: &str) {
                 }
             }
         }
-        // ----- filesystem commands -----
         "mkfs" => {
             fs_format();
             println!("Formatted RAM filesystem ({} blocks x {} bytes = {} bytes)",
@@ -1719,7 +1742,7 @@ fn handle_command(line: &str) {
             unsafe {
                 core::arch::asm!(
                     "movz x0, #0x0009",
-                    "movk x0, #0x8400, lsl 16",
+                    "movk x0, #0x8400, lsl #16",
                     "hvc #0",
                     out("x0") _,
                     options(nostack, nomem)
@@ -1733,16 +1756,30 @@ fn handle_command(line: &str) {
     }
 }
 
+/// Terminal input states for escape sequence detection
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum TermState {
+    Normal,
+    EscapeSeen,
+    BracketSeen,
+}
+
 extern "C" fn shell_thread() -> ! {
     let mut buf = [0u8; MAX_LINE];
     let mut len: usize = 0;
+    let mut cursor: usize = 0;
+    let mut term_state = TermState::Normal;
+    let mut hist_offset: usize = 0;
+    let mut hist_browsing = false;
+    let mut saved_line = [0u8; MAX_LINE];
+    let mut saved_len: usize = 0;
 
     thread_sleep(5);
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.11");
-    println!("     RAM Filesystem");
+    println!("     AdityaOS Shell v1.12");
+    println!("      Interactive");
     println!("=================================");
     println!();
 
@@ -1757,26 +1794,234 @@ extern "C" fn shell_thread() -> ! {
             }
         };
 
+        // Handle escape sequence state machine
+        match term_state {
+            TermState::EscapeSeen => {
+                if c == b'[' {
+                    term_state = TermState::BracketSeen;
+                } else {
+                    term_state = TermState::Normal;
+                }
+                continue;
+            }
+            TermState::BracketSeen => {
+                match c {
+                    b'A' => {
+                        // Up arrow — previous history entry
+                        if !hist_browsing {
+                            // Save current line
+                            saved_len = len;
+                            let mut i = 0;
+                            while i < len {
+                                saved_line[i] = buf[i];
+                                i += 1;
+                            }
+                            hist_browsing = true;
+                            hist_offset = 0;
+                        } else {
+                            hist_offset += 1;
+                        }
+                        unsafe {
+                            match history_get(hist_offset) {
+                                Some(entry) => {
+                                    len = entry.len();
+                                    let mut i = 0;
+                                    while i < len {
+                                        buf[i] = entry[i];
+                                        i += 1;
+                                    }
+                                    cursor = len;
+                                    redraw_line(&buf, len, cursor);
+                                }
+                                None => {
+                                    // No more history; stay at oldest
+                                    hist_offset -= 1;
+                                }
+                            }
+                        }
+                    }
+                    b'B' => {
+                        // Down arrow — next history entry
+                        if hist_browsing {
+                            if hist_offset == 0 {
+                                // Restore saved line
+                                len = saved_len;
+                                let mut i = 0;
+                                while i < len {
+                                    buf[i] = saved_line[i];
+                                    i += 1;
+                                }
+                                cursor = len;
+                                hist_browsing = false;
+                                redraw_line(&buf, len, cursor);
+                            } else {
+                                hist_offset -= 1;
+                                unsafe {
+                                    match history_get(hist_offset) {
+                                        Some(entry) => {
+                                            len = entry.len();
+                                            let mut i = 0;
+                                            while i < len {
+                                                buf[i] = entry[i];
+                                                i += 1;
+                                            }
+                                            cursor = len;
+                                            redraw_line(&buf, len, cursor);
+                                        }
+                                        None => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    b'C' => {
+                        // Right arrow — cursor right
+                        if cursor < len {
+                            cursor += 1;
+                            print!("\x1b[C");
+                        }
+                    }
+                    b'D' => {
+                        // Left arrow — cursor left
+                        if cursor > 0 {
+                            cursor -= 1;
+                            print!("\x1b[D");
+                        }
+                    }
+                    _ => {}
+                }
+                term_state = TermState::Normal;
+                continue;
+            }
+            TermState::Normal => {}
+        }
+
         match c {
+            0x1B => {
+                // ESC — start of escape sequence
+                term_state = TermState::EscapeSeen;
+            }
             0x0D | 0x0A => {
+                // Enter
                 println!();
                 if len < MAX_LINE { buf[len] = 0; }
                 let line = unsafe { core::str::from_utf8_unchecked(&buf[..len]) };
                 handle_command(line);
                 len = 0;
+                cursor = 0;
+                hist_browsing = false;
+                hist_offset = 0;
                 shell_prompt();
             }
             0x7F | 0x08 => {
-                if len > 0 {
+                // Backspace
+                if cursor > 0 {
+                    // Shift left everything after cursor
+                    let mut i = cursor - 1;
+                    while i < len - 1 {
+                        buf[i] = buf[i + 1];
+                        i += 1;
+                    }
                     len -= 1;
-                    print!("\x08 \x08");
+                    cursor -= 1;
+                    redraw_line(&buf, len, cursor);
+                }
+            }
+            0x01 => {
+                // Ctrl+A — cursor to start
+                cursor = 0;
+                // Move cursor to column after prompt
+                let mut back = len;
+                while back > 0 {
+                    print!("\x1b[D");
+                    back -= 1;
+                }
+            }
+            0x05 => {
+                // Ctrl+E — cursor to end
+                while cursor < len {
+                    print!("\x1b[C");
+                    cursor += 1;
+                }
+            }
+            0x03 => {
+                // Ctrl+C — cancel line
+                print!("^C");
+                println!();
+                len = 0;
+                cursor = 0;
+                hist_browsing = false;
+                hist_offset = 0;
+                shell_prompt();
+            }
+            0x0C => {
+                // Ctrl+L — clear screen
+                clear_screen();
+                shell_prompt();
+                let mut i = 0;
+                while i < len {
+                    Uart.putc(buf[i]);
+                    i += 1;
+                }
+                // Reposition cursor
+                let mut back = len - cursor;
+                while back > 0 {
+                    print!("\x1b[D");
+                    back -= 1;
+                }
+            }
+            0x15 => {
+                // Ctrl+U — clear line
+                len = 0;
+                cursor = 0;
+                redraw_line(&buf, len, cursor);
+            }
+            0x17 => {
+                // Ctrl+W — delete last word
+                if cursor > 0 {
+                    // Skip trailing spaces
+                    let mut end = cursor;
+                    while end > 0 && buf[end - 1] == b' ' {
+                        end -= 1;
+                    }
+                    // Skip non-spaces
+                    let mut start = end;
+                    while start > 0 && buf[start - 1] != b' ' {
+                        start -= 1;
+                    }
+                    // Delete range [start, cursor)
+                    let delete_count = cursor - start;
+                    let mut i = start;
+                    while i + delete_count < len {
+                        buf[i] = buf[i + delete_count];
+                        i += 1;
+                    }
+                    len -= delete_count;
+                    cursor = start;
+                    redraw_line(&buf, len, cursor);
                 }
             }
             0x20..=0x7E => {
+                // Printable character — insert at cursor
                 if len < MAX_LINE - 1 {
-                    buf[len] = c;
-                    len += 1;
-                    Uart.putc(c);
+                    if cursor == len {
+                        // Append at end — simple case
+                        buf[len] = c;
+                        len += 1;
+                        cursor += 1;
+                        Uart.putc(c);
+                    } else {
+                        // Insert in middle — shift right
+                        let mut i = len;
+                        while i > cursor {
+                            buf[i] = buf[i - 1];
+                            i -= 1;
+                        }
+                        buf[cursor] = c;
+                        len += 1;
+                        cursor += 1;
+                        redraw_line(&buf, len, cursor);
+                    }
                 }
             }
             _ => {}
@@ -1876,8 +2121,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.11\n", 3);
-    print_slow("     RAM Filesystem\n", 3);
+    print_slow("       AdityaOS v1.12\n", 3);
+    print_slow("      Interactive\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
