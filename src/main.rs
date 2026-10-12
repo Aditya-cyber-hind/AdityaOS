@@ -251,9 +251,7 @@ const BLOCK_NORMAL: u64 = DESC_VALID | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMA
 const BLOCK_DEVICE: u64 = DESC_VALID | DESC_AF | DESC_ATTR_DEVICE;
 
 const TABLE_ENTRY: u64 = DESC_VALID | DESC_TABLE;
-// Table descriptor pointing to the next level. AF=1, no attributes.
 const NEXT_TABLE: u64 = DESC_VALID | DESC_TABLE | DESC_AF;
-// L3 4KB page descriptor: valid, AF, inner shareable, normal memory
 const L3_PAGE_NORMAL: u64 = DESC_VALID | DESC_TABLE | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL;
 
 #[repr(C, align(4096))]
@@ -261,18 +259,9 @@ struct PageTable([u64; 512]);
 
 const MAX_THREADS: usize = 8;
 
-// ---- Kernel master tables (identity map) ----
 static mut TT_KERNEL_L0: PageTable = PageTable([0; 512]);
 static mut TT_KERNEL_L1: PageTable = PageTable([0; 512]);
 
-// ---- Per-thread tables ----
-// Each thread has a full 4-level walk chain for its private mappings:
-//   L0[1] -> thread L1
-//   L1[l1_idx] -> thread L2
-//   L2[l2_idx] -> thread L3
-//   L3[l3_idx] = 4KB page
-//
-// The kernel identity map is still shared via L0[0] -> kernel L1.
 static mut TT_THREAD_L0: [PageTable; MAX_THREADS] =
     [PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]),
      PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512])];
@@ -322,17 +311,13 @@ fn thread_page_tables_init() {
 
         for i in 0..MAX_THREADS {
             let l0 = core::ptr::addr_of_mut!(TT_THREAD_L0[i]) as *mut u64;
-            // L0[0] -> shared kernel L1 (identity map)
             *l0 = (kernel_l1 as u64) | TABLE_ENTRY;
-            // L0[1] -> this thread's private L1 (for VA 512GB..1TB)
             let l1 = core::ptr::addr_of_mut!(TT_THREAD_L1[i]) as *mut u64;
             *l0.add(1) = (l1 as u64) | TABLE_ENTRY;
-            // L0[2..512] unused
             for j in 2..512 {
                 *l0.add(j) = 0;
             }
 
-            // Zero the private L1, L2, L3
             for j in 0..512 {
                 *l1.add(j) = 0;
             }
@@ -360,11 +345,6 @@ fn tt_thread_l0_phys(idx: usize) -> usize {
     }
 }
 
-/// Map virtual address `vaddr` to physical page `paddr` for thread `thread_idx`.
-/// Walks L0->L1->L2->L3, creating intermediate tables on demand.
-/// Only supports VAs in the L0[1] range (512GB..1TB).
-/// Only supports one L2 table and one L3 table per thread for now —
-/// meaning all mappings for a thread must fall inside the same 1GB region.
 fn thread_map_page(thread_idx: usize, vaddr: u64, paddr: u64) -> bool {
     if thread_idx >= MAX_THREADS { return false; }
 
@@ -381,44 +361,14 @@ fn thread_map_page(thread_idx: usize, vaddr: u64, paddr: u64) -> bool {
         let l2 = core::ptr::addr_of_mut!(TT_THREAD_L2[thread_idx]) as *mut u64;
         let l3 = core::ptr::addr_of_mut!(TT_THREAD_L3[thread_idx]) as *mut u64;
 
-        // L0[1] -> L1 (always points to the private L1)
         *l0.add(1) = (l1 as u64) | TABLE_ENTRY;
 
-        // L1[l1_idx] -> L2
-        // Only allow l1_idx == 0 for now (all VAs must be in same 1GB region).
-        // This keeps one L2 and one L3 per thread.
         if l1_idx != 0 { return false; }
         *l1.add(l1_idx) = (l2 as u64) | NEXT_TABLE;
 
-        // L2[l2_idx] -> L3
         *l2.add(l2_idx) = (l3 as u64) | NEXT_TABLE;
 
-        // L3[l3_idx] = page descriptor
         *l3.add(l3_idx) = (paddr & !0xFFFu64) | L3_PAGE_NORMAL;
-
-        core::arch::asm!("dsb ish", options(nostack, nomem));
-        core::arch::asm!("tlbi vmalle1", options(nostack, nomem));
-        core::arch::asm!("dsb ish", options(nostack, nomem));
-        core::arch::asm!("isb", options(nostack, nomem));
-    }
-    true
-}
-
-/// Remove a mapping at vaddr for thread thread_idx by zeroing the L3 entry.
-fn thread_unmap_page(thread_idx: usize, vaddr: u64) -> bool {
-    if thread_idx >= MAX_THREADS { return false; }
-    let l0_idx = ((vaddr >> 39) & 0x1FF) as usize;
-    let l1_idx = ((vaddr >> 30) & 0x1FF) as usize;
-    let l2_idx = ((vaddr >> 21) & 0x1FF) as usize;
-    let l3_idx = ((vaddr >> 12) & 0x1FF) as usize;
-    if l0_idx != 1 || l1_idx != 0 { return false; }
-
-    unsafe {
-        let l2 = core::ptr::addr_of_mut!(TT_THREAD_L2[thread_idx]) as *mut u64;
-        let l2e = core::ptr::read_volatile(l2.add(l2_idx));
-        if (l2e & DESC_VALID) == 0 { return false; }
-        let l3 = (l2e & !0xFFF) as *mut u64;
-        *l3.add(l3_idx) = 0;
 
         core::arch::asm!("dsb ish", options(nostack, nomem));
         core::arch::asm!("tlbi vmalle1", options(nostack, nomem));
@@ -489,6 +439,298 @@ fn read_sctlr() -> u64 {
     let v: u64;
     unsafe { core::arch::asm!("mrs {}, sctlr_el1", out(reg) v, options(nostack, nomem)); }
     v
+}
+
+// ============================================================
+// RAM filesystem
+// ============================================================
+//
+// Flat Unix-like layout:
+//   - Fixed table of inodes (max 32)
+//   - Each inode: name, size, type, up to 4 direct data blocks
+//   - Fixed pool of data blocks (max 64), each 512 bytes
+//
+// Everything is in BSS. No heap involved. No disk. Real filesystem
+// semantics, minimal implementation.
+
+const FS_BLOCK_SIZE: usize = 512;
+const FS_MAX_BLOCKS: usize = 64;
+const FS_MAX_FILES: usize = 32;
+const FS_MAX_NAME: usize = 32;
+const FS_MAX_BLOCKS_PER_FILE: usize = 4;
+const FS_MAGIC: u32 = 0x4164_4F53; // "AdOS"
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum FsNodeType {
+    Empty,
+    File,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct FsInode {
+    pub node_type: FsNodeType,
+    pub name: [u8; FS_MAX_NAME],
+    pub name_len: usize,
+    pub size: usize,
+    pub blocks: [u16; FS_MAX_BLOCKS_PER_FILE],
+    pub block_count: usize,
+}
+
+#[repr(C)]
+pub struct FsState {
+    pub magic: u32,
+    pub formatted: bool,
+    pub total_blocks: usize,
+    pub used_blocks: usize,
+    pub inodes: [FsInode; FS_MAX_FILES],
+    pub blocks: [[u8; FS_BLOCK_SIZE]; FS_MAX_BLOCKS],
+}
+
+static mut FS: FsState = FsState {
+    magic: 0,
+    formatted: false,
+    total_blocks: FS_MAX_BLOCKS,
+    used_blocks: 0,
+    inodes: [FsInode {
+        node_type: FsNodeType::Empty,
+        name: [0; FS_MAX_NAME],
+        name_len: 0,
+        size: 0,
+        blocks: [0; FS_MAX_BLOCKS_PER_FILE],
+        block_count: 0,
+    }; FS_MAX_FILES],
+    blocks: [[0; FS_BLOCK_SIZE]; FS_MAX_BLOCKS],
+};
+
+fn fs_format() -> bool {
+    unsafe {
+        FS.magic = FS_MAGIC;
+        FS.formatted = true;
+        FS.total_blocks = FS_MAX_BLOCKS;
+        FS.used_blocks = 0;
+        for i in 0..FS_MAX_FILES {
+            FS.inodes[i].node_type = FsNodeType::Empty;
+            FS.inodes[i].name = [0; FS_MAX_NAME];
+            FS.inodes[i].name_len = 0;
+            FS.inodes[i].size = 0;
+            FS.inodes[i].blocks = [0; FS_MAX_BLOCKS_PER_FILE];
+            FS.inodes[i].block_count = 0;
+        }
+        for i in 0..FS_MAX_BLOCKS {
+            for j in 0..FS_BLOCK_SIZE {
+                FS.blocks[i][j] = 0;
+            }
+        }
+    }
+    true
+}
+
+fn fs_is_formatted() -> bool {
+    unsafe { FS.formatted }
+}
+
+fn fs_name_to_bytes(name: &str) -> ([u8; FS_MAX_NAME], usize) {
+    let mut buf = [0u8; FS_MAX_NAME];
+    let bytes = name.as_bytes();
+    let n = bytes.len().min(FS_MAX_NAME - 1);
+    let mut i = 0;
+    while i < n {
+        buf[i] = bytes[i];
+        i += 1;
+    }
+    (buf, n)
+}
+
+fn fs_names_equal(inode: &FsInode, name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if inode.name_len != bytes.len() { return false; }
+    let mut i = 0;
+    while i < inode.name_len {
+        if inode.name[i] != bytes[i] { return false; }
+        i += 1;
+    }
+    true
+}
+
+fn fs_find(name: &str) -> Option<usize> {
+    unsafe {
+        for i in 0..FS_MAX_FILES {
+            if FS.inodes[i].node_type == FsNodeType::Empty { continue; }
+            if fs_names_equal(&FS.inodes[i], name) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn fs_find_free_inode() -> Option<usize> {
+    unsafe {
+        for i in 0..FS_MAX_FILES {
+            if FS.inodes[i].node_type == FsNodeType::Empty {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn fs_find_free_block() -> Option<usize> {
+    unsafe {
+        for i in 0..FS_MAX_BLOCKS {
+            let mut used = false;
+            for j in 0..FS_MAX_FILES {
+                if FS.inodes[j].node_type == FsNodeType::Empty { continue; }
+                for k in 0..FS.inodes[j].block_count {
+                    if FS.inodes[j].blocks[k] as usize == i {
+                        used = true;
+                        break;
+                    }
+                }
+                if used { break; }
+            }
+            if !used { return Some(i); }
+        }
+    }
+    None
+}
+
+fn fs_create(name: &str) -> Result<usize, &'static str> {
+    if !fs_is_formatted() {
+        return Err("filesystem not formatted (run mkfs)");
+    }
+    if fs_find(name).is_some() {
+        return Err("file already exists");
+    }
+    if name.is_empty() || name.len() >= FS_MAX_NAME {
+        return Err("invalid name");
+    }
+    let idx = match fs_find_free_inode() {
+        Some(i) => i,
+        None => return Err("no free inodes"),
+    };
+    let (bytes, n) = fs_name_to_bytes(name);
+    unsafe {
+        FS.inodes[idx].node_type = FsNodeType::File;
+        FS.inodes[idx].name = bytes;
+        FS.inodes[idx].name_len = n;
+        FS.inodes[idx].size = 0;
+        FS.inodes[idx].blocks = [0; FS_MAX_BLOCKS_PER_FILE];
+        FS.inodes[idx].block_count = 0;
+    }
+    Ok(idx)
+}
+
+fn fs_write(idx: usize, data: &[u8]) -> Result<usize, &'static str> {
+    unsafe {
+        if idx >= FS_MAX_FILES || FS.inodes[idx].node_type == FsNodeType::Empty {
+            return Err("invalid file");
+        }
+
+        let needed_blocks = (data.len() + FS_BLOCK_SIZE - 1) / FS_BLOCK_SIZE;
+        if needed_blocks > FS_MAX_BLOCKS_PER_FILE {
+            return Err("file too large (max 4 blocks = 2KB)");
+        }
+
+        // Free old blocks (simplistic: just clear the inode's block list)
+        FS.inodes[idx].block_count = 0;
+
+        let mut remaining = data.len();
+        let mut offset = 0;
+        let mut block_num = 0;
+
+        while remaining > 0 && block_num < needed_blocks {
+            let blk = match fs_find_free_block() {
+                Some(b) => b,
+                None => return Err("out of disk space"),
+            };
+            FS.inodes[idx].blocks[block_num] = blk as u16;
+            block_num += 1;
+
+            let to_copy = if remaining > FS_BLOCK_SIZE { FS_BLOCK_SIZE } else { remaining };
+            let mut j = 0;
+            while j < to_copy {
+                FS.blocks[blk][j] = data[offset + j];
+                j += 1;
+            }
+            offset += to_copy;
+            remaining -= to_copy;
+        }
+
+        FS.inodes[idx].block_count = block_num;
+        FS.inodes[idx].size = data.len();
+        Ok(data.len())
+    }
+}
+
+fn fs_read(idx: usize, out: &mut [u8]) -> Result<usize, &'static str> {
+    unsafe {
+        if idx >= FS_MAX_FILES || FS.inodes[idx].node_type == FsNodeType::Empty {
+            return Err("invalid file");
+        }
+        let size = FS.inodes[idx].size;
+        let copy_len = if out.len() < size { out.len() } else { size };
+
+        let mut remaining = copy_len;
+        let mut out_off = 0;
+        for b in 0..FS.inodes[idx].block_count {
+            if remaining == 0 { break; }
+            let blk = FS.inodes[idx].blocks[b] as usize;
+            let to_copy = if remaining > FS_BLOCK_SIZE { FS_BLOCK_SIZE } else { remaining };
+            let mut j = 0;
+            while j < to_copy {
+                out[out_off + j] = FS.blocks[blk][j];
+                j += 1;
+            }
+            out_off += to_copy;
+            remaining -= to_copy;
+        }
+        Ok(copy_len)
+    }
+}
+
+fn fs_delete(name: &str) -> Result<(), &'static str> {
+    let idx = match fs_find(name) {
+        Some(i) => i,
+        None => return Err("file not found"),
+    };
+    unsafe {
+        FS.inodes[idx].node_type = FsNodeType::Empty;
+        FS.inodes[idx].name = [0; FS_MAX_NAME];
+        FS.inodes[idx].name_len = 0;
+        FS.inodes[idx].size = 0;
+        FS.inodes[idx].block_count = 0;
+    }
+    Ok(())
+}
+
+fn fs_file_size(name: &str) -> Option<usize> {
+    match fs_find(name) {
+        Some(i) => unsafe { Some(FS.inodes[i].size) },
+        None => None,
+    }
+}
+
+fn fs_count_files() -> usize {
+    let mut count = 0;
+    unsafe {
+        for i in 0..FS_MAX_FILES {
+            if FS.inodes[i].node_type != FsNodeType::Empty { count += 1; }
+        }
+    }
+    count
+}
+
+fn fs_count_used_blocks() -> usize {
+    let mut count = 0;
+    unsafe {
+        for i in 0..FS_MAX_FILES {
+            if FS.inodes[i].node_type == FsNodeType::Empty { continue; }
+            count += FS.inodes[i].block_count;
+        }
+    }
+    count
 }
 
 // ============================================================
@@ -765,8 +1007,6 @@ fn spawn_many(n: usize) -> usize {
 // VM isolation demo
 // ============================================================
 
-// 512GB + 2MB — falls inside L0[1], L1[0], L2[1], L3[0]
-// (all within the single L2/L3 region we support per thread)
 const DEMO_VA: u64 = 0x80_0000_0000 + 0x20_0000;
 
 static mut DEMO_PHYS: [usize; MAX_THREADS] = [0; MAX_THREADS];
@@ -821,7 +1061,6 @@ fn spawn_vm_demo() -> Option<usize> {
     let slot = find_free_spawn_slot()?;
     let stack_base = spawn_stack_base(slot)?;
 
-    // Reset this thread's private L1/L2/L3 so the demo starts clean.
     unsafe {
         let l1 = core::ptr::addr_of_mut!(TT_THREAD_L1[slot]) as *mut u64;
         let l2 = core::ptr::addr_of_mut!(TT_THREAD_L2[slot]) as *mut u64;
@@ -946,39 +1185,53 @@ fn handle_command(line: &str) {
     match cmd {
         "help" => {
             println!("AdityaOS shell commands:");
+            println!("  === system ===");
             println!("  help                     - show this message");
             println!("  clear                    - clear screen");
             println!("  ticks                    - timer tick count");
             println!("  uptime                   - uptime as HH:MM:SS");
-            println!("  time                     - same as uptime");
-            println!("  threads                  - thread/scheduler info");
-            println!("  tasks                    - thread table");
             println!("  el                       - exception level");
             println!("  regs                     - CPU state");
             println!("  irqs                     - interrupt counts");
-            println!("  echo <text>              - print text");
-            println!("  sleep <ms>               - busy-wait sleep");
+            println!("  mmu                      - MMU registers");
+            println!("  ptdump                   - kernel page table dump");
+            println!("  === threads ===");
+            println!("  threads                  - thread/scheduler info");
+            println!("  tasks                    - thread table");
+            println!("  spawn                    - spawn lifecycle thread");
+            println!("  spawnmany <n>            - spawn N threads");
+            println!("  === memory ===");
             println!("  mem <addr>               - dump 128 bytes");
             println!("  dump <addr> <len>        - dump len bytes");
             println!("  write <addr> <hexbytes>  - write hex bytes");
             println!("  memset <addr> <byte> <len> - fill memory");
             println!("  strlen <addr>            - string length");
-            println!("  history                  - command history");
-            println!("  spawn                    - spawn lifecycle thread");
-            println!("  spawnmany <n>            - spawn N threads");
-            println!("  spam <n>                 - print N long lines");
             println!("  alloc <size>             - allocate memory");
             println!("  heap                     - heap statistics");
-            println!("  ptdump                   - kernel page table dump");
-            println!("  mmu                      - MMU registers");
+            println!("  === virtualization ===");
+            println!("  vmtest                   - setup isolation mappings");
+            println!("  vmdemo                   - 2 threads, same VA, different data");
+            println!("  vminfo                   - show last vmdemo results");
             println!("  tlb <idx> <vaddr> <paddr> - map vaddr->paddr for thread idx");
             println!("  ttbr <idx>               - show thread's TTBR0");
-            println!("  vmtest                   - setup isolation test mappings");
-            println!("  vmdemo                   - run isolation demo (2 threads, same VA)");
-            println!("  vminfo                   - show last vmdemo results");
-            println!("  halt                     - stop the CPU (kernel level)");
+            println!("  === filesystem ===");
+            println!("  mkfs                     - format RAM filesystem");
+            println!("  touch <name>             - create empty file");
+            println!("  writef <name> <text>     - write text to file");
+            println!("  cat <name>               - print file contents");
+            println!("  ls                       - list files");
+            println!("  rm <name>                - delete file");
+            println!("  stat <name>              - file info");
+            println!("  fsinfo                   - filesystem statistics");
+            println!("  === misc ===");
+            println!("  echo <text>              - print text");
+            println!("  sleep <ms>               - busy-wait sleep");
+            println!("  history                  - command history");
+            println!("  spam <n>                 - print N long lines");
+            println!("  halt                     - stop the CPU");
             println!("  shutdown                 - power off via PSCI");
             println!("  reboot                   - reset via PSCI");
+            println!("  panic                    - trigger panic");
         }
         "clear" => clear_screen(),
         "ticks" => println!("Ticks: {}", TICKS.load(Ordering::Relaxed)),
@@ -1246,7 +1499,7 @@ fn handle_command(line: &str) {
                     if thread_map_page(i as usize, va, pa) {
                         println!("Mapped thread {} vaddr {:#x} -> paddr {:#x}", i, va, pa);
                     } else {
-                        println!("tlb: mapping failed (vaddr must be 0x8000000000..0xC000000000, L1 idx 0)");
+                        println!("tlb: mapping failed");
                     }
                 }
                 _ => println!("Usage: tlb <thread_idx> <vaddr> <paddr>"),
@@ -1296,6 +1549,149 @@ fn handle_command(line: &str) {
                 }
             }
         }
+        // ----- filesystem commands -----
+        "mkfs" => {
+            fs_format();
+            println!("Formatted RAM filesystem ({} blocks x {} bytes = {} bytes)",
+                FS_MAX_BLOCKS, FS_BLOCK_SIZE, FS_MAX_BLOCKS * FS_BLOCK_SIZE);
+        }
+        "touch" => {
+            if args.is_empty() {
+                println!("Usage: touch <name>");
+            } else {
+                match fs_create(args) {
+                    Ok(_) => println!("Created: {}", args),
+                    Err(e) => println!("touch: {}", e),
+                }
+            }
+        }
+        "writef" => {
+            let mut parts2 = args.splitn(2, ' ');
+            let name = parts2.next().unwrap_or("");
+            let text = parts2.next().unwrap_or("");
+            if name.is_empty() {
+                println!("Usage: writef <name> <text>");
+            } else {
+                match fs_find(name) {
+                    Some(idx) => {
+                        match fs_write(idx, text.as_bytes()) {
+                            Ok(n) => println!("Wrote {} bytes to {}", n, name),
+                            Err(e) => println!("writef: {}", e),
+                        }
+                    }
+                    None => {
+                        match fs_create(name) {
+                            Ok(idx) => match fs_write(idx, text.as_bytes()) {
+                                Ok(n) => println!("Created {} and wrote {} bytes", name, n),
+                                Err(e) => println!("writef: {}", e),
+                            },
+                            Err(e) => println!("writef: {}", e),
+                        }
+                    }
+                }
+            }
+        }
+        "cat" => {
+            if args.is_empty() {
+                println!("Usage: cat <name>");
+            } else {
+                match fs_find(args) {
+                    Some(idx) => {
+                        let size = unsafe { FS.inodes[idx].size };
+                        if size == 0 {
+                            println!("(empty file)");
+                        } else {
+                            let mut buf = [0u8; FS_BLOCK_SIZE * FS_MAX_BLOCKS_PER_FILE];
+                            match fs_read(idx, &mut buf) {
+                                Ok(n) => {
+                                    match core::str::from_utf8(&buf[..n]) {
+                                        Ok(s) => println!("{}", s),
+                                        Err(_) => {
+                                            println!("(binary file, {} bytes)", n);
+                                        }
+                                    }
+                                }
+                                Err(e) => println!("cat: {}", e),
+                            }
+                        }
+                    }
+                    None => println!("cat: {}: no such file", args),
+                }
+            }
+        }
+        "ls" => {
+            if !fs_is_formatted() {
+                println!("Filesystem not formatted. Run 'mkfs' first.");
+            } else {
+                let count = fs_count_files();
+                if count == 0 {
+                    println!("(empty directory)");
+                } else {
+                    println!("NAME                             SIZE");
+                    println!("------------------------------   ------");
+                    unsafe {
+                        for i in 0..FS_MAX_FILES {
+                            if FS.inodes[i].node_type == FsNodeType::Empty { continue; }
+                            let mut line = [b' '; 40];
+                            for j in 0..FS.inodes[i].name_len {
+                                line[j] = FS.inodes[i].name[j];
+                            }
+                            let name_str = core::str::from_utf8_unchecked(&line[..30]);
+                            println!("{:<30}   {} bytes", name_str, FS.inodes[i].size);
+                        }
+                    }
+                }
+            }
+        }
+        "rm" => {
+            if args.is_empty() {
+                println!("Usage: rm <name>");
+            } else {
+                match fs_delete(args) {
+                    Ok(_) => println!("Removed: {}", args),
+                    Err(e) => println!("rm: {}", e),
+                }
+            }
+        }
+        "stat" => {
+            if args.is_empty() {
+                println!("Usage: stat <name>");
+            } else {
+                match fs_find(args) {
+                    Some(idx) => unsafe {
+                        let inode = &FS.inodes[idx];
+                        let mut line = [0u8; FS_MAX_NAME];
+                        for j in 0..inode.name_len {
+                            line[j] = inode.name[j];
+                        }
+                        let name_str = core::str::from_utf8_unchecked(&line[..inode.name_len]);
+                        println!("File: {}", name_str);
+                        println!("  type:   file");
+                        println!("  size:   {} bytes", inode.size);
+                        println!("  blocks: {}", inode.block_count);
+                        for k in 0..inode.block_count {
+                            println!("    block[{}] -> #{}", k, inode.blocks[k]);
+                        }
+                    },
+                    None => println!("stat: {}: no such file", args),
+                }
+            }
+        }
+        "fsinfo" => {
+            if !fs_is_formatted() {
+                println!("Filesystem not formatted. Run 'mkfs' first.");
+            } else {
+                println!("Filesystem: RAM-backed (in BSS)");
+                println!("  magic:        {:#010x}", unsafe { FS.magic });
+                println!("  block size:   {} bytes", FS_BLOCK_SIZE);
+                println!("  total blocks: {}", FS_MAX_BLOCKS);
+                println!("  used blocks:  {}", fs_count_used_blocks());
+                println!("  free blocks:  {}", FS_MAX_BLOCKS - fs_count_used_blocks());
+                println!("  total bytes:  {}", FS_MAX_BLOCKS * FS_BLOCK_SIZE);
+                println!("  max inodes:   {}", FS_MAX_FILES);
+                println!("  files:        {}", fs_count_files());
+            }
+        }
         "halt" => {
             println!("Halting (CPU stopped). Use 'shutdown' to power off, or close QEMU.");
             sleep_ms(200);
@@ -1323,7 +1719,7 @@ fn handle_command(line: &str) {
             unsafe {
                 core::arch::asm!(
                     "movz x0, #0x0009",
-                    "movk x0, #0x8400, lsl #16",
+                    "movk x0, #0x8400, lsl 16",
                     "hvc #0",
                     out("x0") _,
                     options(nostack, nomem)
@@ -1345,8 +1741,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.10a");
-    println!("    VM Isolation Demo");
+    println!("     AdityaOS Shell v1.11");
+    println!("     RAM Filesystem");
     println!("=================================");
     println!();
 
@@ -1401,7 +1797,6 @@ pub extern "C" fn rust_exception_handler(esr: u64, elr: u64, far: u64) {
     println!("  FAR_EL1: {:#018x}", far);
     let ec = (esr >> 26) & 0x3F;
     println!("  EC: {:#x}", ec);
-    // Decode DFSC for data aborts
     if ec == 0x24 || ec == 0x25 {
         let dfsc = esr & 0x3F;
         println!("  DFSC: {:#x}", dfsc);
@@ -1481,8 +1876,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.10a\n", 3);
-    print_slow("    VM Isolation Demo\n", 3);
+    print_slow("       AdityaOS v1.11\n", 3);
+    print_slow("     RAM Filesystem\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
