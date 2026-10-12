@@ -6,7 +6,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 // ============================================================
-// Spinlock (defined, still unused)
+// Spinlock
 // ============================================================
 
 pub struct SpinLock {
@@ -49,9 +49,9 @@ const UART0_IMSC: usize = UART0_BASE + 0x38;
 const UART0_ICR:  usize = UART0_BASE + 0x44;
 const UART0_CR:   usize = UART0_BASE + 0x30;
 
-const UART0_TXFF: u32   = 1 << 5;
-const UART0_RXFE: u32   = 1 << 4;
-const UART0_RXIM: u32   = 1 << 4;
+const UART0_TXFF: u32 = 1 << 5;
+const UART0_RXFE: u32 = 1 << 4;
+const UART0_RXIM: u32 = 1 << 4;
 
 pub struct Uart;
 
@@ -233,9 +233,7 @@ pub fn kmalloc(size: usize, align: usize) -> *mut u8 {
     }
 }
 
-pub fn kfree(_ptr: *mut u8) {
-    // Bump allocator does not reclaim memory.
-}
+pub fn kfree(_ptr: *mut u8) {}
 
 // ============================================================
 // Page tables + MMU
@@ -249,48 +247,136 @@ const DESC_SH_INNER: u64 = 0b11 << 8;
 const DESC_ATTR_NORMAL: u64 = 0 << 2;
 const DESC_ATTR_DEVICE: u64 = 1 << 2;
 
-const BLOCK_NORMAL: u64 =
-    DESC_VALID | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL;
-const BLOCK_DEVICE: u64 =
-    DESC_VALID | DESC_AF | DESC_ATTR_DEVICE;
+const BLOCK_NORMAL: u64 = DESC_VALID | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL;
+const BLOCK_DEVICE: u64 = DESC_VALID | DESC_AF | DESC_ATTR_DEVICE;
 
 const TABLE_ENTRY: u64 = DESC_VALID | DESC_TABLE;
+const L2_TABLE_NORMAL: u64 = DESC_VALID | DESC_TABLE | DESC_AF;
+const L3_PAGE_NORMAL: u64 = DESC_VALID | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL;
 
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
 
-static mut TT_L0: PageTable = PageTable([0; 512]);
-static mut TT_L1: PageTable = PageTable([0; 512]);
+const MAX_THREADS: usize = 8;
 
-static TT_L0_PHYS: AtomicUsize = AtomicUsize::new(0);
+static mut TT_KERNEL_L0: PageTable = PageTable([0; 512]);
+static mut TT_KERNEL_L1: PageTable = PageTable([0; 512]);
 
-fn page_tables_init() {
+static mut TT_THREAD_L0: [PageTable; MAX_THREADS] =
+    [PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]),
+     PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512])];
+
+static mut TT_THREAD_L2: [PageTable; MAX_THREADS] =
+    [PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]),
+     PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512])];
+
+static mut TT_THREAD_L3: [PageTable; MAX_THREADS] =
+    [PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]),
+     PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512]), PageTable([0; 512])];
+
+static TT_KERNEL_L0_PHYS: AtomicUsize = AtomicUsize::new(0);
+static TT_THREAD_L0_PHYS: [AtomicUsize; MAX_THREADS] = [
+    AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
+    AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0),
+];
+
+fn kernel_page_tables_init() {
     unsafe {
-        let l0 = core::ptr::addr_of_mut!(TT_L0) as *mut u64;
-        let l1 = core::ptr::addr_of_mut!(TT_L1) as *mut u64;
+        let l0 = core::ptr::addr_of_mut!(TT_KERNEL_L0) as *mut u64;
+        let l1 = core::ptr::addr_of_mut!(TT_KERNEL_L1) as *mut u64;
         *l0 = (l1 as u64) | TABLE_ENTRY;
 
-        let l1_slice = core::ptr::addr_of_mut!(TT_L1.0) as *mut u64;
-        *l1_slice.add(0) = (0x0000_0000u64) | BLOCK_DEVICE;
-        *l1_slice.add(1) = (0x4000_0000u64) | BLOCK_NORMAL;
-
+        let l1_slice = core::ptr::addr_of_mut!(TT_KERNEL_L1.0) as *mut u64;
+        *l1_slice.add(0) = 0x0000_0000u64 | BLOCK_DEVICE;
+        *l1_slice.add(1) = 0x4000_0000u64 | BLOCK_NORMAL;
         for i in 2..512 {
             *l1_slice.add(i) = 0;
         }
 
-        TT_L0_PHYS.store(l0 as usize, Ordering::Relaxed);
+        TT_KERNEL_L0_PHYS.store(l0 as usize, Ordering::Relaxed);
     }
 }
 
-fn tt_l0_phys() -> usize {
-    TT_L0_PHYS.load(Ordering::Relaxed)
+fn tt_kernel_l0_phys() -> usize {
+    TT_KERNEL_L0_PHYS.load(Ordering::Relaxed)
+}
+
+fn thread_page_tables_init() {
+    unsafe {
+        let kernel_l1 = core::ptr::addr_of!(TT_KERNEL_L1) as usize;
+
+        for i in 0..MAX_THREADS {
+            let l0 = core::ptr::addr_of_mut!(TT_THREAD_L0[i]) as *mut u64;
+            *l0 = (kernel_l1 as u64) | TABLE_ENTRY;
+            for j in 1..512 {
+                *l0.add(j) = 0;
+            }
+            TT_THREAD_L0_PHYS[i].store(l0 as usize, Ordering::Relaxed);
+        }
+    }
+}
+
+fn tt_thread_l0_phys(idx: usize) -> usize {
+    if idx < MAX_THREADS {
+        TT_THREAD_L0_PHYS[idx].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// Map virtual address `vaddr` to physical page `paddr` for the given thread.
+/// Uses the private L0[1] slot (covers VA range 0x80_0000_0000..0x100_0000_0000,
+/// i.e. 512GB..1TB). One L2 and one L3 per thread for now.
+fn thread_map_page(thread_idx: usize, vaddr: u64, paddr: u64) -> bool {
+    if thread_idx >= MAX_THREADS { return false; }
+
+    let l0_idx = ((vaddr >> 39) & 0x1FF) as usize;
+    let l2_idx = ((vaddr >> 21) & 0x1FF) as usize;
+    let l3_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+    // Only support VAs whose L0 index is 1 (512GB..1TB).
+    // This lets us reuse a single per-thread L2/L3 table without needing
+    // a full tree.
+    if l0_idx != 1 { return false; }
+
+    unsafe {
+        let l0 = core::ptr::addr_of_mut!(TT_THREAD_L0[thread_idx]) as *mut u64;
+        let l2 = core::ptr::addr_of_mut!(TT_THREAD_L2[thread_idx]) as *mut u64;
+        let l3 = core::ptr::addr_of_mut!(TT_THREAD_L3[thread_idx]) as *mut u64;
+
+        // L0[1] -> private L2 (table descriptor)
+        *l0.add(1) = (l2 as u64) | TABLE_ENTRY;
+
+        // L2[l2_idx] -> private L3 (table descriptor)
+        *l2.add(l2_idx) = (l3 as u64) | L2_TABLE_NORMAL;
+
+        // L3[l3_idx] = page descriptor
+        *l3.add(l3_idx) = (paddr & !0xFFFu64) | L3_PAGE_NORMAL;
+
+        // Flush TLB and instruction stream
+        core::arch::asm!("dsb ish", options(nostack, nomem));
+        core::arch::asm!("tlbi vmalle1", options(nostack, nomem));
+        core::arch::asm!("dsb ish", options(nostack, nomem));
+        core::arch::asm!("isb", options(nostack, nomem));
+    }
+    true
+}
+
+fn set_ttbr0(phys: u64) {
+    unsafe {
+        core::arch::asm!("msr ttbr0_el1, {v}", v = in(reg) phys, options(nostack, nomem));
+        core::arch::asm!("dsb ish", options(nostack, nomem));
+        core::arch::asm!("tlbi vmalle1", options(nostack, nomem));
+        core::arch::asm!("dsb ish", options(nostack, nomem));
+        core::arch::asm!("isb", options(nostack, nomem));
+    }
 }
 
 const MAIR_VALUE: u64 = 0x0000_0000_0000_04FF;
 const TCR_VALUE: u64 = 0x0000_0000_3080_3510;
 
 fn mmu_configure() {
-    let ttbr0 = tt_l0_phys() as u64;
+    let ttbr0 = tt_kernel_l0_phys() as u64;
     unsafe {
         core::arch::asm!("msr mair_el1, {v}", v = in(reg) MAIR_VALUE, options(nostack, nomem));
         core::arch::asm!("msr tcr_el1,  {v}", v = in(reg) TCR_VALUE,  options(nostack, nomem));
@@ -299,27 +385,18 @@ fn mmu_configure() {
     }
 }
 
-/// Enable the MMU. Called once, at the very end of kmain.
-/// After this, every load/store goes through the identity page tables.
 fn mmu_enable() {
     unsafe {
-        // Complete all prior memory accesses and page table writes.
-        core::arch::asm!("dsb sy",  options(nostack, nomem));
-        core::arch::asm!("isb",     options(nostack, nomem));
-
-        // Invalidate any stale TLB entries.
+        core::arch::asm!("dsb sy", options(nostack, nomem));
+        core::arch::asm!("isb", options(nostack, nomem));
         core::arch::asm!("tlbi vmalle1", options(nostack, nomem));
-        core::arch::asm!("dsb ish",       options(nostack, nomem));
-        core::arch::asm!("isb",           options(nostack, nomem));
+        core::arch::asm!("dsb ish", options(nostack, nomem));
+        core::arch::asm!("isb", options(nostack, nomem));
 
-        // Read SCTLR_EL1, set M bit (bit 0), write back.
-        // Caches stay OFF (bits 2 and 12 unchanged).
         let mut sctlr: u64;
         core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nostack, nomem));
         sctlr |= 1;
         core::arch::asm!("msr sctlr_el1, {}", in(reg) sctlr, options(nostack, nomem));
-
-        // Ensure the write takes effect before any more instructions execute.
         core::arch::asm!("isb", options(nostack, nomem));
     }
 }
@@ -467,8 +544,6 @@ pub struct Context {
 }
 
 const STACK_SIZE: usize = 16 * 1024;
-const MAX_THREADS: usize = 8;
-
 const SHELL_SLOT: usize = 2;
 const FIRST_SPAWN_SLOT: usize = 3;
 
@@ -725,32 +800,35 @@ fn handle_command(line: &str) {
             println!("AdityaOS shell commands:");
             println!("  help                     - show this message");
             println!("  clear                    - clear screen");
-            println!("  ticks                    - show timer tick count");
-            println!("  uptime                   - show uptime as HH:MM:SS");
+            println!("  ticks                    - timer tick count");
+            println!("  uptime                   - uptime as HH:MM:SS");
             println!("  time                     - same as uptime");
-            println!("  threads                  - show thread/scheduler info");
-            println!("  tasks                    - show thread table with state");
-            println!("  el                       - show current exception level");
-            println!("  regs                     - dump CPU state");
-            println!("  irqs                     - show interrupt counts");
-            println!("  echo <text>              - print text back");
+            println!("  threads                  - thread/scheduler info");
+            println!("  tasks                    - thread table");
+            println!("  el                       - exception level");
+            println!("  regs                     - CPU state");
+            println!("  irqs                     - interrupt counts");
+            println!("  echo <text>              - print text");
             println!("  sleep <ms>               - busy-wait sleep");
-            println!("  mem <addr>               - dump 128 bytes at addr");
-            println!("  dump <addr> <len>        - dump len bytes at addr");
+            println!("  mem <addr>               - dump 128 bytes");
+            println!("  dump <addr> <len>        - dump len bytes");
             println!("  write <addr> <hexbytes>  - write hex bytes");
             println!("  memset <addr> <byte> <len> - fill memory");
-            println!("  strlen <addr>            - null-terminated string length");
-            println!("  history                  - show command history");
-            println!("  spawn                    - spawn one lifecycle thread");
-            println!("  spawnmany <n>            - spawn N lifecycle threads");
+            println!("  strlen <addr>            - string length");
+            println!("  history                  - command history");
+            println!("  spawn                    - spawn lifecycle thread");
+            println!("  spawnmany <n>            - spawn N threads");
             println!("  spam <n>                 - print N long lines");
-            println!("  alloc <size>             - allocate memory (bump)");
-            println!("  heap                     - show heap statistics");
-            println!("  ptdump                   - dump page table entries");
-            println!("  mmu                      - show MMU registers");
-            println!("  halt                     - stop the CPU cleanly");
-            println!("  panic                    - trigger a kernel panic");
-            println!("  reboot                   - reset the system (PSCI)");
+            println!("  alloc <size>             - allocate memory");
+            println!("  heap                     - heap statistics");
+            println!("  ptdump                   - kernel page table dump");
+            println!("  mmu                      - MMU registers");
+            println!("  tlb <idx> <vaddr> <paddr> - map vaddr→paddr for thread idx");
+            println!("  ttbr <idx>               - show thread's TTBR0");
+            println!("  vmtest                   - test virtual memory isolation");
+            println!("  halt                     - stop the CPU");
+            println!("  panic                    - trigger panic");
+            println!("  reboot                   - PSCI reset");
         }
         "clear" => clear_screen(),
         "ticks" => println!("Ticks: {}", TICKS.load(Ordering::Relaxed)),
@@ -776,14 +854,14 @@ fn handle_command(line: &str) {
             println!("Switches: {}", SWITCHES.load(Ordering::Relaxed));
         }
         "tasks" => {
-            println!("Idx  State    WakeAt             SP                 ELR");
+            println!("Idx  State    WakeAt             SP                 TTBR0");
             println!("---  -------  -----------------  -----------------  -----------------");
             unsafe {
                 for i in 0..MAX_THREADS {
                     let s = STATE[i];
                     if s == ThreadState::Unused { continue; }
                     println!("{:>3}  {:<7}  {:<17}  {:#018x}  {:#018x}",
-                        i, state_name(s), CTX[i].wake_at, CTX[i].sp, CTX[i].elr);
+                        i, state_name(s), CTX[i].wake_at, CTX[i].sp, tt_thread_l0_phys(i));
                 }
             }
         }
@@ -823,7 +901,7 @@ fn handle_command(line: &str) {
             let len = parse_u64(len_str);
             match (addr, len) {
                 (Some(a), Some(l)) if l > 0 && l <= 4096 => dump_hex_ascii(a, l as usize),
-                _ => println!("Usage: dump <hex addr> <len>  (len 1..4096)"),
+                _ => println!("Usage: dump <hex addr> <len>"),
             }
         }
         "write" => {
@@ -935,7 +1013,7 @@ fn handle_command(line: &str) {
                 }
                 println!("[spam done]");
             } else {
-                println!("Usage: spam <n>  (n 1..200)");
+                println!("Usage: spam <n>");
             }
         }
         "alloc" => {
@@ -968,18 +1046,18 @@ fn handle_command(line: &str) {
             println!("Allocs:     {}", HEAP_ALLOCS.load(Ordering::Relaxed));
         }
         "ptdump" => {
-            let l0 = tt_l0_phys();
-            println!("Page table base (TT_L0): {:#018x}", l0);
+            let l0 = tt_kernel_l0_phys();
+            println!("Kernel TT_L0: {:#018x}", l0);
             unsafe {
                 let l0_ptr = l0 as *const u64;
                 let l0_entry0 = core::ptr::read_volatile(l0_ptr);
-                println!("L0[0] = {:#018x}", l0_entry0);
+                println!("Kernel L0[0] = {:#018x}", l0_entry0);
                 let l1 = (l0_entry0 & !0xFFF) as *const u64;
-                println!("L1 base = {:#018x}", l1 as usize);
+                println!("Kernel L1 base = {:#018x}", l1 as usize);
                 let l1_0 = core::ptr::read_volatile(l1);
                 let l1_1 = core::ptr::read_volatile(l1.add(1));
-                println!("L1[0] = {:#018x}  (maps 0x0000_0000..0x4000_0000)", l1_0);
-                println!("L1[1] = {:#018x}  (maps 0x4000_0000..0x8000_0000)", l1_1);
+                println!("Kernel L1[0] = {:#018x}", l1_0);
+                println!("Kernel L1[1] = {:#018x}", l1_1);
             }
         }
         "mmu" => {
@@ -989,9 +1067,63 @@ fn handle_command(line: &str) {
             println!("SCTLR_EL1: {:#018x}", read_sctlr());
             let sctlr = read_sctlr();
             if (sctlr & 1) == 0 {
-                println!("MMU: OFF (SCTLR_EL1.M = 0)");
+                println!("MMU: OFF");
             } else {
-                println!("MMU: ON  (SCTLR_EL1.M = 1)");
+                println!("MMU: ON");
+            }
+        }
+        "ttbr" => {
+            if let Some(idx) = parse_u64(args) {
+                let i = idx as usize;
+                if i < MAX_THREADS {
+                    println!("Thread {} TTBR0 = {:#018x}", i, tt_thread_l0_phys(i));
+                } else {
+                    println!("Thread index must be 0..{}", MAX_THREADS);
+                }
+            } else {
+                for i in 0..MAX_THREADS {
+                    println!("Thread {} TTBR0 = {:#018x}", i, tt_thread_l0_phys(i));
+                }
+            }
+        }
+        "tlb" => {
+            let mut parts2 = args.split_whitespace();
+            let idx_s = parts2.next().unwrap_or("");
+            let va_s = parts2.next().unwrap_or("");
+            let pa_s = parts2.next().unwrap_or("");
+            match (parse_u64(idx_s), parse_hex(va_s), parse_hex(pa_s)) {
+                (Some(i), Some(va), Some(pa)) if (i as usize) < MAX_THREADS => {
+                    if thread_map_page(i as usize, va, pa) {
+                        println!("Mapped thread {} vaddr {:#x} -> paddr {:#x}", i, va, pa);
+                    } else {
+                        println!("tlb: mapping failed (vaddr must be 0x80_0000_0000..0x100_0000_0000)");
+                    }
+                }
+                _ => println!("Usage: tlb <thread_idx> <vaddr> <paddr>"),
+            }
+        }
+        "vmtest" => {
+            let p1 = kmalloc(4096, 4096);
+            let p2 = kmalloc(4096, 4096);
+            if p1.is_null() || p2.is_null() {
+                println!("vmtest: out of memory");
+            } else {
+                let pa1 = p1 as u64;
+                let pa2 = p2 as u64;
+                println!("vmtest: allocated physical pages at {:#x} and {:#x}", pa1, pa2);
+
+                // VA in 512GB..1TB range so L0 index = 1.
+                let va: u64 = 0x80_0000_0000 + 0x10_0000;
+
+                if !thread_map_page(0, va, pa1) || !thread_map_page(1, va, pa2) {
+                    println!("vmtest: mapping failed");
+                } else {
+                    println!("vmtest: mapped VA {:#x}", va);
+                    println!("  thread 0 -> physical {:#x}", pa1);
+                    println!("  thread 1 -> physical {:#x}", pa2);
+                    println!("Both threads now have the same VA mapped to different physical pages.");
+                    println!("(Use future 'vread' command from each thread to see isolation.)");
+                }
             }
         }
         "halt" => {
@@ -1029,8 +1161,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.8c");
-    println!("      MMU ENABLED");
+    println!("     AdityaOS Shell v1.9");
+    println!("   Per-Thread Page Tables");
     println!("=================================");
     println!();
 
@@ -1125,6 +1257,12 @@ pub extern "C" fn rust_irq_handler(current: *mut Context) -> *const Context {
                     }
                 }
                 STATE[nxt] = ThreadState::Running;
+
+                let new_ttbr = tt_thread_l0_phys(nxt);
+                if new_ttbr != 0 {
+                    set_ttbr0(new_ttbr as u64);
+                }
+
                 next = &CTX[nxt] as *const Context;
             }
             CURRENT.store(nxt, Ordering::Relaxed);
@@ -1154,8 +1292,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.8c\n", 3);
-    print_slow("        MMU ENABLED\n", 3);
+    print_slow("       AdityaOS v1.9\n", 3);
+    print_slow("   Per-Thread Page Tables\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
@@ -1167,15 +1305,17 @@ pub extern "C" fn kmain() -> ! {
     println!("  heap: {:#x}..{:#x} ({} MB)",
         HEAP_START, HEAP_END, HEAP_SIZE / (1024 * 1024));
 
-    println!("Building page tables (identity map)...");
-    page_tables_init();
-    println!("  TT_L0 at {:#x}", tt_l0_phys());
+    println!("Building kernel page tables (identity map)...");
+    kernel_page_tables_init();
+    println!("  Kernel TT_L0 at {:#x}", tt_kernel_l0_phys());
+
+    println!("Building per-thread page tables...");
+    thread_page_tables_init();
+    println!("  Thread 0 TTBR0 = {:#x}", tt_thread_l0_phys(0));
+    println!("  Thread 1 TTBR0 = {:#x}", tt_thread_l0_phys(1));
 
     println!("Configuring MMU registers...");
     mmu_configure();
-    println!("  MAIR_EL1  = {:#018x}", read_mair());
-    println!("  TCR_EL1   = {:#018x}", read_tcr());
-    println!("  TTBR0_EL1 = {:#018x}", read_ttbr0());
 
     let mut buf: [u8; 16] = [0; 16];
     unsafe {
@@ -1202,11 +1342,17 @@ pub extern "C" fn kmain() -> ! {
     enable_irqs();
     println!();
 
-    // ---- The moment of truth ----
     println!("Enabling MMU...");
     mmu_enable();
     println!("MMU enabled! SCTLR_EL1 = {:#018x}", read_sctlr());
     println!();
+
+    let ttbr0 = tt_thread_l0_phys(0) as u64;
+    if ttbr0 != 0 {
+        set_ttbr0(ttbr0);
+        println!("Switched to thread 0's page table (TTBR0 = {:#x})", ttbr0);
+        println!();
+    }
 
     unsafe {
         STATE[0] = ThreadState::Running;
