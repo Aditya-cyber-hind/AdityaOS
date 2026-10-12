@@ -238,6 +238,80 @@ pub fn kfree(_ptr: *mut u8) {
 }
 
 // ============================================================
+// Page tables (identity map, MMU still OFF)
+// ============================================================
+//
+// ARM64 4KB-granule translation:
+//   - 4 levels: L0 -> L1 -> L2 -> L3
+//   - Each table is 4KB (512 entries, 8 bytes each)
+//   - L1 blocks: 1GB, L2 blocks: 2MB, L3 pages: 4KB
+//
+// We build a minimal identity map using L1 block descriptors:
+//   L0[0] -> L1
+//   L1[0] -> 0x0000_0000..0x4000_0000 as DEVICE memory  (covers GIC, UART)
+//   L1[1] -> 0x4000_0000..0x8000_0000 as NORMAL memory  (RAM, kernel, heap)
+//
+// Offsets inside L1: entry index = virtual address >> 30.
+
+// Descriptor bits (from ARMv8-A spec, section D8.3)
+const DESC_VALID:  u64 = 1 << 0;
+const DESC_TABLE:  u64 = 1 << 1;   // block vs table: 1 = table (for L0..L2)
+const DESC_AF:     u64 = 1 << 10;  // Access Flag
+const DESC_SH_INNER: u64 = 0b11 << 8;
+
+// MAIR indices: we set MAIR[0] = Normal, MAIR[1] = Device
+const DESC_ATTR_NORMAL: u64 = 0 << 2;
+const DESC_ATTR_DEVICE: u64 = 1 << 2;
+
+// For a block descriptor at L1, bit 1 must be 0 (block) and bit 0 = 1 (valid).
+// But the raw L1 entry for a table has bit 1 = 1.
+// Block descriptors are stored with bit 1 = 0.
+
+const BLOCK_NORMAL: u64 =
+    DESC_VALID | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL;
+const BLOCK_DEVICE: u64 =
+    DESC_VALID | DESC_AF | DESC_ATTR_DEVICE;
+
+const TABLE_ENTRY: u64 = DESC_VALID | DESC_TABLE;
+
+// Page tables must be 4KB-aligned. We reserve a static-aligned region.
+#[repr(C, align(4096))]
+struct PageTable([u64; 512]);
+
+static mut TT_L0: PageTable = PageTable([0; 512]);
+static mut TT_L1: PageTable = PageTable([0; 512]);
+
+// Save the physical base of TT_L0 so we can reference it later
+static TT_L0_PHYS: AtomicUsize = AtomicUsize::new(0);
+
+fn page_tables_init() {
+    unsafe {
+        // L0[0] = pointer to TT_L1 as a table descriptor
+        let l0 = &mut TT_L0 as *mut PageTable as *mut u64;
+        let l1 = &mut TT_L1 as *mut PageTable as *mut u64;
+        *l0 = (l1 as u64) | TABLE_ENTRY;
+
+        // L1[0] = block descriptor mapping 0x0000_0000..0x4000_0000 as DEVICE
+        // L1[1] = block descriptor mapping 0x4000_0000..0x8000_0000 as NORMAL
+        let l1_slice = &mut TT_L1.0;
+        l1_slice[0] = (0x0000_0000u64) | BLOCK_DEVICE;
+        l1_slice[1] = (0x4000_0000u64) | BLOCK_NORMAL;
+
+        // Zero the rest (already zero, but be explicit)
+        for i in 2..512 {
+            l1_slice[i] = 0;
+        }
+
+        // Save L0 physical base
+        TT_L0_PHYS.store(l0 as usize, Ordering::Relaxed);
+    }
+}
+
+fn tt_l0_phys() -> usize {
+    TT_L0_PHYS.load(Ordering::Relaxed)
+}
+
+// ============================================================
 // MMIO + GIC + Timer
 // ============================================================
 
@@ -544,7 +618,6 @@ fn parse_hex(s: &str) -> Option<u64> {
     u64::from_str_radix(s, 16).ok()
 }
 
-/// Parse a hex byte pair like "DE" or "de". Returns None on invalid input.
 fn parse_hex_byte(s: &str) -> Option<u8> {
     if s.len() != 2 { return None; }
     u8::from_str_radix(s, 16).ok()
@@ -583,7 +656,6 @@ fn state_name(s: ThreadState) -> &'static str {
     }
 }
 
-/// Format uptime as HH:MM:SS and print it.
 fn print_uptime_hms() {
     let secs = read_cntpct() / read_cntfrq();
     let h = secs / 3600;
@@ -592,7 +664,6 @@ fn print_uptime_hms() {
     println!("Uptime: {:02}:{:02}:{:02}", h, m, s);
 }
 
-/// Compute the length of a null-terminated string at addr. Capped at 4096.
 fn strlen_at(addr: u64) -> usize {
     let mut n = 0;
     while n < 4096 {
@@ -629,15 +700,16 @@ fn handle_command(line: &str) {
             println!("  sleep <ms>               - busy-wait sleep");
             println!("  mem <addr>               - dump 128 bytes at addr");
             println!("  dump <addr> <len>        - dump len bytes at addr");
-            println!("  write <addr> <hexbytes>  - write hex bytes (e.g. DEADBEEF)");
-            println!("  memset <addr> <byte> <len> - fill memory with a byte");
-            println!("  strlen <addr>            - length of null-terminated string");
+            println!("  write <addr> <hexbytes>  - write hex bytes");
+            println!("  memset <addr> <byte> <len> - fill memory");
+            println!("  strlen <addr>            - null-terminated string length");
             println!("  history                  - show command history");
             println!("  spawn                    - spawn one lifecycle thread");
-            println!("  spawnmany <n>            - spawn up to N lifecycle threads");
-            println!("  spam <n>                 - print N long lines (TX stress)");
+            println!("  spawnmany <n>            - spawn N lifecycle threads");
+            println!("  spam <n>                 - print N long lines");
             println!("  alloc <size>             - allocate memory (bump)");
             println!("  heap                     - show heap statistics");
+            println!("  ptdump                   - dump page table entries");
             println!("  halt                     - stop the CPU cleanly");
             println!("  panic                    - trigger a kernel panic");
             println!("  reboot                   - reset the system (PSCI)");
@@ -702,7 +774,7 @@ fn handle_command(line: &str) {
             if let Some(addr) = parse_hex(args) {
                 dump_hex_ascii(addr, 128);
             } else {
-                println!("Usage: mem <hex address>  e.g. mem 0x40080000");
+                println!("Usage: mem <hex address>");
             }
         }
         "dump" => {
@@ -724,7 +796,6 @@ fn handle_command(line: &str) {
                 Some(addr) => {
                     if bytes_str.is_empty() || bytes_str.len() % 2 != 0 {
                         println!("Usage: write <hex addr> <hexbytes>");
-                        println!("  example: write 0x48000000 DEADBEEF");
                     } else {
                         let mut i = 0;
                         let mut ok = true;
@@ -775,7 +846,7 @@ fn handle_command(line: &str) {
                     }
                     println!("Filled {} bytes at {:#x} with 0x{:02x}", l, a, b);
                 }
-                _ => println!("Usage: memset <hex addr> <hex byte> <len>  (len 1..65536)"),
+                _ => println!("Usage: memset <hex addr> <hex byte> <len>"),
             }
         }
         "strlen" => {
@@ -858,6 +929,22 @@ fn handle_command(line: &str) {
             println!("Free:       {} bytes", free);
             println!("Allocs:     {}", HEAP_ALLOCS.load(Ordering::Relaxed));
         }
+        "ptdump" => {
+            let l0 = tt_l0_phys();
+            println!("Page table base (TT_L0): {:#018x}", l0);
+            unsafe {
+                let l0_ptr = l0 as *const u64;
+                let l0_entry0 = core::ptr::read_volatile(l0_ptr);
+                println!("L0[0] = {:#018x}", l0_entry0);
+                let l1 = (l0_entry0 & !0xFFF) as *const u64;
+                println!("L1 base = {:#018x}", l1 as usize);
+                let l1_0 = core::ptr::read_volatile(l1);
+                let l1_1 = core::ptr::read_volatile(l1.add(1));
+                println!("L1[0] = {:#018x}  (maps 0x0000_0000..0x4000_0000)", l1_0);
+                println!("L1[1] = {:#018x}  (maps 0x4000_0000..0x8000_0000)", l1_1);
+            }
+            println!("MMU: currently OFF");
+        }
         "halt" => {
             println!("Halting...");
             sleep_ms(100);
@@ -893,8 +980,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.7");
-    println!("   Debug Command Pack");
+    println!("     AdityaOS Shell v1.8a");
+    println!("    Page Tables (MMU off)");
     println!("=================================");
     println!();
 
@@ -1018,8 +1105,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.7\n", 3);
-    print_slow("    Debug Command Pack\n", 3);
+    print_slow("       AdityaOS v1.8a\n", 3);
+    print_slow("    Page Tables (MMU off)\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
@@ -1030,6 +1117,12 @@ pub extern "C" fn kmain() -> ! {
     heap_init();
     println!("  heap: {:#x}..{:#x} ({} MB)",
         HEAP_START, HEAP_END, HEAP_SIZE / (1024 * 1024));
+
+    println!("Building page tables (identity map)...");
+    page_tables_init();
+    println!("  TT_L0 at {:#x}", tt_l0_phys());
+    println!("  L1 maps: 0x00000000..0x40000000 (DEVICE), 0x40000000..0x80000000 (NORMAL)");
+    println!("  MMU: OFF");
 
     let mut buf: [u8; 16] = [0; 16];
     unsafe {
