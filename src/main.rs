@@ -192,10 +192,8 @@ pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
 // Heap allocator (bump)
 // ============================================================
 
-// Heap region: after the kernel image. Chosen as a fixed address
-// inside QEMU virt RAM (which spans 0x40000000..0x50000000).
-const HEAP_START: usize = 0x4800_0000;      // 128 MB mark
-const HEAP_END:   usize = 0x4F00_0000;      // 240 MB mark
+const HEAP_START: usize = 0x4800_0000;
+const HEAP_END:   usize = 0x4F00_0000;
 const HEAP_SIZE:  usize = HEAP_END - HEAP_START;
 
 static HEAP_NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -212,24 +210,17 @@ fn heap_used() -> usize {
 }
 
 pub fn kmalloc(size: usize, align: usize) -> *mut u8 {
-    if size == 0 { return core::ptr::null_mut(); }
-    if align == 0 { return core::ptr::null_mut(); }
+    if size == 0 || align == 0 { return core::ptr::null_mut(); }
 
-    // Atomic bump: get a unique aligned address
     loop {
         let cur = HEAP_NEXT.load(Ordering::Relaxed);
-        if cur == 0 { return core::ptr::null_mut(); }  // heap not initialized
+        if cur == 0 { return core::ptr::null_mut(); }
 
-        // Align up
         let aligned = (cur + align - 1) & !(align - 1);
         let end = aligned + size;
 
-        if end > HEAP_END {
-            return core::ptr::null_mut();  // out of memory
-        }
+        if end > HEAP_END { return core::ptr::null_mut(); }
 
-        // Try to reserve [aligned, end). If someone else raced us,
-        // we retry the whole loop.
         match HEAP_NEXT.compare_exchange_weak(
             cur, end, Ordering::AcqRel, Ordering::Relaxed)
         {
@@ -242,7 +233,6 @@ pub fn kmalloc(size: usize, align: usize) -> *mut u8 {
     }
 }
 
-/// No-op for bump allocator. Present so the API is stable.
 pub fn kfree(_ptr: *mut u8) {
     // Bump allocator does not reclaim memory.
 }
@@ -554,6 +544,12 @@ fn parse_hex(s: &str) -> Option<u64> {
     u64::from_str_radix(s, 16).ok()
 }
 
+/// Parse a hex byte pair like "DE" or "de". Returns None on invalid input.
+fn parse_hex_byte(s: &str) -> Option<u8> {
+    if s.len() != 2 { return None; }
+    u8::from_str_radix(s, 16).ok()
+}
+
 fn dump_hex_ascii(addr: u64, len: usize) {
     println!("Dump at {:#x}, {} bytes:", addr, len);
     let mut offset = 0;
@@ -587,6 +583,26 @@ fn state_name(s: ThreadState) -> &'static str {
     }
 }
 
+/// Format uptime as HH:MM:SS and print it.
+fn print_uptime_hms() {
+    let secs = read_cntpct() / read_cntfrq();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    println!("Uptime: {:02}:{:02}:{:02}", h, m, s);
+}
+
+/// Compute the length of a null-terminated string at addr. Capped at 4096.
+fn strlen_at(addr: u64) -> usize {
+    let mut n = 0;
+    while n < 4096 {
+        let byte = unsafe { core::ptr::read_volatile((addr + n as u64) as *const u8) };
+        if byte == 0 { break; }
+        n += 1;
+    }
+    n
+}
+
 fn handle_command(line: &str) {
     let trimmed = line.trim();
     if trimmed.is_empty() { return; }
@@ -599,33 +615,36 @@ fn handle_command(line: &str) {
     match cmd {
         "help" => {
             println!("AdityaOS shell commands:");
-            println!("  help            - show this message");
-            println!("  clear           - clear screen");
-            println!("  ticks           - show timer tick count");
-            println!("  uptime          - show seconds since boot");
-            println!("  time            - same as uptime");
-            println!("  threads         - show thread/scheduler info");
-            println!("  tasks           - show thread table with state");
-            println!("  el              - show current exception level");
-            println!("  regs            - dump CPU state");
-            println!("  irqs            - show interrupt counts");
-            println!("  echo <text>     - print text back");
-            println!("  sleep <ms>      - busy-wait sleep");
-            println!("  mem <addr>      - dump 128 bytes at hex addr");
-            println!("  history         - show command history");
-            println!("  spawn           - spawn one lifecycle thread");
-            println!("  spawnmany <n>   - spawn up to N lifecycle threads");
-            println!("  alloc <size>    - allocate memory (bump)");
-            println!("  heap            - show heap statistics");
-            println!("  panic           - trigger a kernel panic");
-            println!("  reboot          - reset the system (PSCI)");
+            println!("  help                     - show this message");
+            println!("  clear                    - clear screen");
+            println!("  ticks                    - show timer tick count");
+            println!("  uptime                   - show uptime as HH:MM:SS");
+            println!("  time                     - same as uptime");
+            println!("  threads                  - show thread/scheduler info");
+            println!("  tasks                    - show thread table with state");
+            println!("  el                       - show current exception level");
+            println!("  regs                     - dump CPU state");
+            println!("  irqs                     - show interrupt counts");
+            println!("  echo <text>              - print text back");
+            println!("  sleep <ms>               - busy-wait sleep");
+            println!("  mem <addr>               - dump 128 bytes at addr");
+            println!("  dump <addr> <len>        - dump len bytes at addr");
+            println!("  write <addr> <hexbytes>  - write hex bytes (e.g. DEADBEEF)");
+            println!("  memset <addr> <byte> <len> - fill memory with a byte");
+            println!("  strlen <addr>            - length of null-terminated string");
+            println!("  history                  - show command history");
+            println!("  spawn                    - spawn one lifecycle thread");
+            println!("  spawnmany <n>            - spawn up to N lifecycle threads");
+            println!("  spam <n>                 - print N long lines (TX stress)");
+            println!("  alloc <size>             - allocate memory (bump)");
+            println!("  heap                     - show heap statistics");
+            println!("  halt                     - stop the CPU cleanly");
+            println!("  panic                    - trigger a kernel panic");
+            println!("  reboot                   - reset the system (PSCI)");
         }
         "clear" => clear_screen(),
         "ticks" => println!("Ticks: {}", TICKS.load(Ordering::Relaxed)),
-        "uptime" | "time" => {
-            let secs = read_cntpct() / read_cntfrq();
-            println!("Uptime: {} seconds", secs);
-        }
+        "uptime" | "time" => print_uptime_hms(),
         "threads" => {
             let mut live = 0;
             let mut dead = 0;
@@ -686,6 +705,87 @@ fn handle_command(line: &str) {
                 println!("Usage: mem <hex address>  e.g. mem 0x40080000");
             }
         }
+        "dump" => {
+            let mut parts2 = args.split_whitespace();
+            let addr_str = parts2.next().unwrap_or("");
+            let len_str = parts2.next().unwrap_or("");
+            let addr = parse_hex(addr_str);
+            let len = parse_u64(len_str);
+            match (addr, len) {
+                (Some(a), Some(l)) if l > 0 && l <= 4096 => dump_hex_ascii(a, l as usize),
+                _ => println!("Usage: dump <hex addr> <len>  (len 1..4096)"),
+            }
+        }
+        "write" => {
+            let mut parts2 = args.split_whitespace();
+            let addr_str = parts2.next().unwrap_or("");
+            let bytes_str = parts2.next().unwrap_or("");
+            match parse_hex(addr_str) {
+                Some(addr) => {
+                    if bytes_str.is_empty() || bytes_str.len() % 2 != 0 {
+                        println!("Usage: write <hex addr> <hexbytes>");
+                        println!("  example: write 0x48000000 DEADBEEF");
+                    } else {
+                        let mut i = 0;
+                        let mut ok = true;
+                        let bytes = bytes_str.as_bytes();
+                        let mut written = 0;
+                        while i < bytes.len() {
+                            let pair = unsafe {
+                                core::str::from_utf8_unchecked(&bytes[i..i+2])
+                            };
+                            match parse_hex_byte(pair) {
+                                Some(b) => {
+                                    unsafe {
+                                        core::ptr::write_volatile(
+                                            (addr + written as u64) as *mut u8, b);
+                                    }
+                                    written += 1;
+                                }
+                                None => { ok = false; break; }
+                            }
+                            i += 2;
+                        }
+                        if ok {
+                            println!("Wrote {} bytes at {:#x}", written, addr);
+                        } else {
+                            println!("write: invalid hex bytes");
+                        }
+                    }
+                }
+                None => println!("Usage: write <hex addr> <hexbytes>"),
+            }
+        }
+        "memset" => {
+            let mut parts2 = args.split_whitespace();
+            let addr_str = parts2.next().unwrap_or("");
+            let byte_str = parts2.next().unwrap_or("");
+            let len_str = parts2.next().unwrap_or("");
+            let addr = parse_hex(addr_str);
+            let byte = parse_hex_byte(byte_str);
+            let len = parse_u64(len_str);
+            match (addr, byte, len) {
+                (Some(a), Some(b), Some(l)) if l > 0 && l <= 65536 => {
+                    let mut i = 0u64;
+                    while i < l {
+                        unsafe {
+                            core::ptr::write_volatile((a + i) as *mut u8, b);
+                        }
+                        i += 1;
+                    }
+                    println!("Filled {} bytes at {:#x} with 0x{:02x}", l, a, b);
+                }
+                _ => println!("Usage: memset <hex addr> <hex byte> <len>  (len 1..65536)"),
+            }
+        }
+        "strlen" => {
+            if let Some(addr) = parse_hex(args) {
+                let n = strlen_at(addr);
+                println!("Length: {} bytes", n);
+            } else {
+                println!("Usage: strlen <hex addr>");
+            }
+        }
         "history" => {
             let total = HISTORY_COUNT.load(Ordering::Relaxed);
             let count = total.min(HISTORY_SIZE);
@@ -717,6 +817,18 @@ fn handle_command(line: &str) {
                 println!("Usage: spawnmany <n>");
             }
         }
+        "spam" => {
+            if let Some(n) = parse_u64(args) {
+                let n = n.min(200) as usize;
+                for i in 1..=n {
+                    println!("[spam {:>3}/{}] AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        i, n);
+                }
+                println!("[spam done]");
+            } else {
+                println!("Usage: spam <n>  (n 1..200)");
+            }
+        }
         "alloc" => {
             if let Some(size) = parse_u64(args) {
                 let size = size as usize;
@@ -745,6 +857,12 @@ fn handle_command(line: &str) {
             println!("Used:       {} bytes", used);
             println!("Free:       {} bytes", free);
             println!("Allocs:     {}", HEAP_ALLOCS.load(Ordering::Relaxed));
+        }
+        "halt" => {
+            println!("Halting...");
+            sleep_ms(100);
+            unsafe { core::arch::asm!("msr daifset, #2", options(nostack, nomem)); }
+            loop { unsafe { core::arch::asm!("wfi", options(nostack, nomem)); } }
         }
         "panic" => panic!("user-triggered panic"),
         "reboot" => {
@@ -775,8 +893,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.6");
-    println!("     Memory Allocator");
+    println!("     AdityaOS Shell v1.7");
+    println!("   Debug Command Pack");
     println!("=================================");
     println!();
 
@@ -900,8 +1018,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.6\n", 3);
-    print_slow("     Memory Allocator\n", 3);
+    print_slow("       AdityaOS v1.7\n", 3);
+    print_slow("    Debug Command Pack\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
