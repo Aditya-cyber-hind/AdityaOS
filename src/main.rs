@@ -6,7 +6,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 // ============================================================
-// Spinlock (defined, but not yet used anywhere)
+// Spinlock (defined, still unused)
 // ============================================================
 
 pub struct SpinLock {
@@ -250,7 +250,15 @@ pub struct Context {
 }
 
 const STACK_SIZE: usize = 16 * 1024;
-const NUM_THREADS: usize = 4;
+const MAX_THREADS: usize = 8;
+
+// Slots:
+//   0 = A (idle)
+//   1 = B (idle)
+//   2 = shell
+//   3..8 = spawnable
+const SHELL_SLOT: usize = 2;
+const FIRST_SPAWN_SLOT: usize = 3;
 
 #[repr(align(16))]
 struct Stack([u8; STACK_SIZE]);
@@ -258,16 +266,26 @@ struct Stack([u8; STACK_SIZE]);
 static STACK_A: Stack = Stack([0; STACK_SIZE]);
 static STACK_B: Stack = Stack([0; STACK_SIZE]);
 static STACK_SHELL: Stack = Stack([0; STACK_SIZE]);
-static STACK_SPAWN: Stack = Stack([0; STACK_SIZE]);
 
-static mut CTX: [Context; NUM_THREADS] = [
+// Five spawn stacks — one per spawnable slot (3..8)
+static STACK_S1: Stack = Stack([0; STACK_SIZE]);
+static STACK_S2: Stack = Stack([0; STACK_SIZE]);
+static STACK_S3: Stack = Stack([0; STACK_SIZE]);
+static STACK_S4: Stack = Stack([0; STACK_SIZE]);
+static STACK_S5: Stack = Stack([0; STACK_SIZE]);
+
+static mut CTX: [Context; MAX_THREADS] = [
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
     Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
     Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
     Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
     Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5 },
 ];
 
-static mut STATE: [ThreadState; NUM_THREADS] = [ThreadState::Unused; NUM_THREADS];
+static mut STATE: [ThreadState; MAX_THREADS] = [ThreadState::Unused; MAX_THREADS];
 
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
@@ -280,12 +298,12 @@ extern "C" fn thread_a() -> ! { loop { core::hint::spin_loop(); } }
 extern "C" fn thread_b() -> ! { loop { core::hint::spin_loop(); } }
 
 extern "C" fn spawned_lifecycle_thread() -> ! {
-    println!("[thread started: will run for ~2s]");
+    println!("[spawned: hello]");
     for i in 1..=4 {
         sleep_ms(500);
-        println!("[thread heartbeat {}]", i);
+        println!("[spawned: heartbeat {}]", i);
     }
-    println!("[thread exiting]");
+    println!("[spawned: exiting]");
     thread_exit();
 }
 
@@ -294,7 +312,7 @@ pub fn thread_exit() -> ! {
         let me = CURRENT.load(Ordering::Relaxed);
         STATE[me] = ThreadState::Dead;
     }
-    println!("[thread_exit: marked dead, yielding]");
+    println!("[thread_exit]");
     loop { core::hint::spin_loop(); }
 }
 
@@ -310,25 +328,79 @@ pub fn sched_init() {
         CTX[1].spsr = 0x5;
         STATE[1] = ThreadState::Ready;
 
-        CTX[2].sp = STACK_SHELL.0.as_ptr().add(STACK_SIZE) as u64;
-        CTX[2].elr = shell_thread as *const () as usize as u64;
-        CTX[2].spsr = 0x5;
-        STATE[2] = ThreadState::Ready;
+        CTX[SHELL_SLOT].sp = STACK_SHELL.0.as_ptr().add(STACK_SIZE) as u64;
+        CTX[SHELL_SLOT].elr = shell_thread as *const () as usize as u64;
+        CTX[SHELL_SLOT].spsr = 0x5;
+        STATE[SHELL_SLOT] = ThreadState::Ready;
     }
 }
 
-fn spawn_lifecycle() -> Option<usize> {
-    const SLOT: usize = 3;
-    unsafe {
-        if STATE[SLOT] != ThreadState::Unused && STATE[SLOT] != ThreadState::Dead {
-            return None;
-        }
-        CTX[SLOT].sp = STACK_SPAWN.0.as_ptr().add(STACK_SIZE) as u64;
-        CTX[SLOT].elr = spawned_lifecycle_thread as *const () as usize as u64;
-        CTX[SLOT].spsr = 0x5;
-        STATE[SLOT] = ThreadState::Ready;
+/// Return the stack base for a spawnable slot index (3..8).
+fn spawn_stack_base(slot: usize) -> Option<usize> {
+    match slot {
+        3 => Some(STACK_S1.0.as_ptr() as usize),
+        4 => Some(STACK_S2.0.as_ptr() as usize),
+        5 => Some(STACK_S3.0.as_ptr() as usize),
+        6 => Some(STACK_S4.0.as_ptr() as usize),
+        7 => Some(STACK_S5.0.as_ptr() as usize),
+        _ => None,
     }
-    Some(SLOT)
+}
+
+/// Find a slot that can be spawned into: prefer Dead, then Unused.
+fn find_free_spawn_slot() -> Option<usize> {
+    unsafe {
+        // Prefer dead slots
+        for i in FIRST_SPAWN_SLOT..MAX_THREADS {
+            if STATE[i] == ThreadState::Dead {
+                return Some(i);
+            }
+        }
+        // Then unused
+        for i in FIRST_SPAWN_SLOT..MAX_THREADS {
+            if STATE[i] == ThreadState::Unused {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+fn spawn_lifecycle_in_slot(slot: usize) -> bool {
+    let stack_base = match spawn_stack_base(slot) {
+        Some(b) => b,
+        None => return false,
+    };
+    unsafe {
+        if STATE[slot] != ThreadState::Unused && STATE[slot] != ThreadState::Dead {
+            return false;
+        }
+        CTX[slot].sp = stack_base as u64 + STACK_SIZE as u64;
+        CTX[slot].elr = spawned_lifecycle_thread as *const () as usize as u64;
+        CTX[slot].spsr = 0x5;
+        STATE[slot] = ThreadState::Ready;
+    }
+    true
+}
+
+fn spawn_lifecycle() -> Option<usize> {
+    let slot = find_free_spawn_slot()?;
+    if spawn_lifecycle_in_slot(slot) {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+fn spawn_many(n: usize) -> usize {
+    let mut count = 0;
+    for _ in 0..n {
+        match spawn_lifecycle() {
+            Some(_) => count += 1,
+            None => break,
+        }
+    }
+    count
 }
 
 // ============================================================
@@ -410,22 +482,23 @@ fn handle_command(line: &str) {
     match cmd {
         "help" => {
             println!("AdityaOS shell commands:");
-            println!("  help         - show this message");
-            println!("  clear        - clear screen");
-            println!("  ticks        - show timer tick count");
-            println!("  uptime       - show seconds since boot");
-            println!("  time         - same as uptime");
-            println!("  threads      - show thread/scheduler info");
-            println!("  tasks        - show thread table with state");
-            println!("  el           - show current exception level");
-            println!("  regs         - dump CPU state");
-            println!("  echo <text>  - print text back");
-            println!("  sleep <ms>   - sleep for N milliseconds");
-            println!("  mem <addr>   - dump 128 bytes at hex addr");
-            println!("  history      - show command history");
-            println!("  spawn        - spawn a lifecycle thread (~2s, then exits)");
-            println!("  panic        - trigger a kernel panic");
-            println!("  reboot       - reset the system (PSCI)");
+            println!("  help          - show this message");
+            println!("  clear         - clear screen");
+            println!("  ticks         - show timer tick count");
+            println!("  uptime        - show seconds since boot");
+            println!("  time          - same as uptime");
+            println!("  threads       - show thread/scheduler info");
+            println!("  tasks         - show thread table with state");
+            println!("  el            - show current exception level");
+            println!("  regs          - dump CPU state");
+            println!("  echo <text>   - print text back");
+            println!("  sleep <ms>    - sleep for N milliseconds");
+            println!("  mem <addr>    - dump 128 bytes at hex addr");
+            println!("  history       - show command history");
+            println!("  spawn         - spawn one lifecycle thread");
+            println!("  spawnmany <n> - spawn up to N lifecycle threads");
+            println!("  panic         - trigger a kernel panic");
+            println!("  reboot        - reset the system (PSCI)");
         }
         "clear" => clear_screen(),
         "ticks" => println!("Ticks: {}", TICKS.load(Ordering::Relaxed)),
@@ -435,12 +508,18 @@ fn handle_command(line: &str) {
         }
         "threads" => {
             let mut live = 0;
+            let mut dead = 0;
             unsafe {
-                for i in 0..NUM_THREADS {
-                    if STATE[i] != ThreadState::Unused { live += 1; }
+                for i in 0..MAX_THREADS {
+                    match STATE[i] {
+                        ThreadState::Unused => {}
+                        ThreadState::Dead => dead += 1,
+                        _ => live += 1,
+                    }
                 }
             }
-            println!("Threads live: {}", live);
+            println!("Live threads: {}", live);
+            println!("Dead threads: {}", dead);
             println!("Current: {}", CURRENT.load(Ordering::Relaxed));
             println!("Switches: {}", SWITCHES.load(Ordering::Relaxed));
         }
@@ -448,7 +527,7 @@ fn handle_command(line: &str) {
             println!("Idx  State    SP                 ELR");
             println!("---  -------  -----------------  -----------------");
             unsafe {
-                for i in 0..NUM_THREADS {
+                for i in 0..MAX_THREADS {
                     let s = STATE[i];
                     if s == ThreadState::Unused { continue; }
                     println!("{:>3}  {:<7}  {:#018x}  {:#018x}",
@@ -499,7 +578,16 @@ fn handle_command(line: &str) {
         "spawn" => {
             match spawn_lifecycle() {
                 Some(idx) => println!("Spawned lifecycle thread in slot {}", idx),
-                None => println!("Spawn slot busy (thread alive or not yet reaped)."),
+                None => println!("No free spawn slots."),
+            }
+        }
+        "spawnmany" => {
+            if let Some(n) = parse_u64(args) {
+                let n = n.min(10) as usize;
+                let count = spawn_many(n);
+                println!("Spawned {} threads.", count);
+            } else {
+                println!("Usage: spawnmany <n>");
             }
         }
         "panic" => panic!("user-triggered panic"),
@@ -531,8 +619,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.2a");
-    println!("    Thread Lifecycle");
+    println!("     AdityaOS Shell v1.3");
+    println!("     N-Slot Thread Table");
     println!("=================================");
     println!();
 
@@ -606,8 +694,8 @@ pub extern "C" fn rust_irq_handler(current: *mut Context) -> *const Context {
 
             let mut nxt = cur;
             unsafe {
-                for step in 1..=NUM_THREADS {
-                    let cand = (cur + step) % NUM_THREADS;
+                for step in 1..=MAX_THREADS {
+                    let cand = (cur + step) % MAX_THREADS;
                     if STATE[cand] == ThreadState::Ready || STATE[cand] == ThreadState::Running {
                         nxt = cand;
                         break;
@@ -641,8 +729,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.2a\n", 3);
-    print_slow("    Lock Type Defined\n", 3);
+    print_slow("       AdityaOS v1.3\n", 3);
+    print_slow("    N-Slot Thread Table\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
