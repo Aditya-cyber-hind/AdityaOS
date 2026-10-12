@@ -6,7 +6,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 // ============================================================
-// Spinlock (defined, still unused)
+// Spinlock (still unused; the RX ring buffer is lock-free)
 // ============================================================
 
 pub struct SpinLock {
@@ -43,10 +43,15 @@ static UART_LOCK: SpinLock = SpinLock::new();
 // ============================================================
 
 const UART0_BASE: usize = 0x0900_0000;
-const UART0_DR:   usize = UART0_BASE + 0x00;
-const UART0_FR:   usize = UART0_BASE + 0x18;
+const UART0_DR:   usize = UART0_BASE + 0x00;  // Data register
+const UART0_FR:   usize = UART0_BASE + 0x18;  // Flag register
+const UART0_IMSC: usize = UART0_BASE + 0x38;  // Interrupt mask set/clear
+const UART0_ICR:  usize = UART0_BASE + 0x44;  // Interrupt clear register
+const UART0_CR:   usize = UART0_BASE + 0x30;  // Control register
+
 const UART0_TXFF: u32   = 1 << 5;
 const UART0_RXFE: u32   = 1 << 4;
+const UART0_RXIM: u32   = 1 << 4;  // RX interrupt mask bit
 
 pub struct Uart;
 
@@ -80,11 +85,42 @@ macro_rules! println {
     ($($arg:tt)*) => {{ use core::fmt::Write; let _ = write!($crate::Uart, $($arg)*); let _ = write!($crate::Uart, "\n"); }};
 }
 
-fn uart_getc() -> u8 {
-    unsafe {
-        while (core::ptr::read_volatile(UART0_FR as *const u32) & UART0_RXFE) != 0 {}
-        (core::ptr::read_volatile(UART0_DR as *const u32) & 0xFF) as u8
+// ============================================================
+// UART RX ring buffer (lock-free SPSC)
+// ============================================================
+
+const RX_BUF_SIZE: usize = 256;
+
+static mut RX_BUF: [u8; RX_BUF_SIZE] = [0; RX_BUF_SIZE];
+static RX_HEAD: AtomicUsize = AtomicUsize::new(0); // written by IRQ handler
+static RX_TAIL: AtomicUsize = AtomicUsize::new(0); // written by consumer
+
+/// Called from IRQ handler when a byte arrives.
+/// Only the IRQ handler ever calls this.
+fn rx_push(byte: u8) {
+    let head = RX_HEAD.load(Ordering::Relaxed);
+    let tail = RX_TAIL.load(Ordering::Acquire);
+    let next = (head + 1) % RX_BUF_SIZE;
+    if next == tail {
+        // Buffer full — drop the byte
+        return;
     }
+    unsafe {
+        RX_BUF[head] = byte;
+    }
+    RX_HEAD.store(next, Ordering::Release);
+}
+
+/// Called by the shell. Returns Some(byte) if available, None otherwise.
+fn uart_try_getc() -> Option<u8> {
+    let tail = RX_TAIL.load(Ordering::Relaxed);
+    let head = RX_HEAD.load(Ordering::Acquire);
+    if tail == head {
+        return None;
+    }
+    let byte = unsafe { RX_BUF[tail] };
+    RX_TAIL.store((tail + 1) % RX_BUF_SIZE, Ordering::Release);
+    Some(byte)
 }
 
 // ============================================================
@@ -177,7 +213,8 @@ const GICD_BASE: usize = 0x0800_0000;
 const GICC_BASE: usize = 0x0801_0000;
 
 const GICD_CTLR:       usize = GICD_BASE + 0x000;
-const GICD_ISENABLER0: usize = GICD_BASE + 0x100;
+const GICD_ISENABLER0: usize = GICD_BASE + 0x100;   // SGIs and PPIs (0..31)
+const GICD_ISENABLER1: usize = GICD_BASE + 0x104;   // SPIs (32..63)
 const GICD_IPRIORITYR: usize = GICD_BASE + 0x400;
 const GICD_ITARGETSR:  usize = GICD_BASE + 0x800;
 
@@ -187,21 +224,40 @@ const GICC_IAR:  usize = GICC_BASE + 0x00C;
 const GICC_EOIR: usize = GICC_BASE + 0x010;
 
 const IRQ_CNTPNS: u32 = 30;
+const IRQ_UART0:  u32 = 33;  // PL011 UART0 on QEMU virt
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+static UART_IRQS: AtomicU64 = AtomicU64::new(0);
+
+fn gic_enable_irq(id: u32) {
+    if id < 32 {
+        // SGI or PPI — set bit in ISENABLER0
+        mmio_write32(GICD_ISENABLER0, 1u32 << id);
+    } else {
+        // SPI — set bit in ISENABLER1 at position (id - 32)
+        mmio_write32(GICD_ISENABLER1, 1u32 << (id - 32));
+    }
+
+    // Priority (byte per IRQ)
+    unsafe {
+        let pri = (GICD_IPRIORITYR + id as usize) as *mut u8;
+        core::ptr::write_volatile(pri, 0x80);
+    }
+
+    // Target CPU 0
+    unsafe {
+        let tgt = (GICD_ITARGETSR + id as usize) as *mut u8;
+        core::ptr::write_volatile(tgt, 0x01);
+    }
+}
 
 fn gic_init() {
     mmio_write32(GICD_CTLR, 1);
     mmio_write32(GICC_PMR, 0xFF);
     mmio_write32(GICC_CTLR, 1);
-    let mask = 1u32 << IRQ_CNTPNS;
-    mmio_write32(GICD_ISENABLER0, mask);
-    unsafe {
-        let pri = (GICD_IPRIORITYR + IRQ_CNTPNS as usize) as *mut u8;
-        core::ptr::write_volatile(pri, 0x80);
-        let tgt = (GICD_ITARGETSR + IRQ_CNTPNS as usize) as *mut u8;
-        core::ptr::write_volatile(tgt, 0x01);
-    }
+
+    gic_enable_irq(IRQ_CNTPNS);
+    gic_enable_irq(IRQ_UART0);
 }
 
 fn timer_init() {
@@ -223,6 +279,43 @@ fn timer_rearm() {
     unsafe {
         core::arch::asm!("msr cntp_tval_el0, {tval}", tval = in(reg) tval, options(nostack, nomem));
     }
+}
+
+/// Enable UART RX interrupts. Also enables the UART itself.
+fn uart_enable_rx_irq() {
+    unsafe {
+        // Disable UART while configuring
+        mmio_write32(UART0_CR, 0);
+
+        // Clear any pending interrupts
+        mmio_write32(UART0_ICR, 0x7FF);
+
+        // Enable RX interrupt in the mask register
+        mmio_write32(UART0_IMSC, UART0_RXIM);
+
+        // Enable UART: UARTEN | TXE | RXE
+        //   UARTEN = bit 0, TXE = bit 8, RXE = bit 9
+        mmio_write32(UART0_CR, (1 << 0) | (1 << 8) | (1 << 9));
+    }
+}
+
+/// Handle a UART interrupt. Called from the IRQ handler.
+fn uart_handle_irq() {
+    UART_IRQS.fetch_add(1, Ordering::Relaxed);
+
+    // Drain the RX FIFO — read until no more data
+    loop {
+        let fr = mmio_read32(UART0_FR);
+        if (fr & UART0_RXFE) != 0 {
+            break;
+        }
+        let dr = mmio_read32(UART0_DR);
+        let byte = (dr & 0xFF) as u8;
+        rx_push(byte);
+    }
+
+    // Clear RX interrupt
+    mmio_write32(UART0_ICR, UART0_RXIM);
 }
 
 fn enable_irqs() {
@@ -252,11 +345,6 @@ pub struct Context {
 const STACK_SIZE: usize = 16 * 1024;
 const MAX_THREADS: usize = 8;
 
-// Slots:
-//   0 = A (idle)
-//   1 = B (idle)
-//   2 = shell
-//   3..8 = spawnable
 const SHELL_SLOT: usize = 2;
 const FIRST_SPAWN_SLOT: usize = 3;
 
@@ -267,7 +355,6 @@ static STACK_A: Stack = Stack([0; STACK_SIZE]);
 static STACK_B: Stack = Stack([0; STACK_SIZE]);
 static STACK_SHELL: Stack = Stack([0; STACK_SIZE]);
 
-// Five spawn stacks — one per spawnable slot (3..8)
 static STACK_S1: Stack = Stack([0; STACK_SIZE]);
 static STACK_S2: Stack = Stack([0; STACK_SIZE]);
 static STACK_S3: Stack = Stack([0; STACK_SIZE]);
@@ -335,7 +422,6 @@ pub fn sched_init() {
     }
 }
 
-/// Return the stack base for a spawnable slot index (3..8).
 fn spawn_stack_base(slot: usize) -> Option<usize> {
     match slot {
         3 => Some(STACK_S1.0.as_ptr() as usize),
@@ -347,16 +433,13 @@ fn spawn_stack_base(slot: usize) -> Option<usize> {
     }
 }
 
-/// Find a slot that can be spawned into: prefer Dead, then Unused.
 fn find_free_spawn_slot() -> Option<usize> {
     unsafe {
-        // Prefer dead slots
         for i in FIRST_SPAWN_SLOT..MAX_THREADS {
             if STATE[i] == ThreadState::Dead {
                 return Some(i);
             }
         }
-        // Then unused
         for i in FIRST_SPAWN_SLOT..MAX_THREADS {
             if STATE[i] == ThreadState::Unused {
                 return Some(i);
@@ -385,11 +468,7 @@ fn spawn_lifecycle_in_slot(slot: usize) -> bool {
 
 fn spawn_lifecycle() -> Option<usize> {
     let slot = find_free_spawn_slot()?;
-    if spawn_lifecycle_in_slot(slot) {
-        Some(slot)
-    } else {
-        None
-    }
+    if spawn_lifecycle_in_slot(slot) { Some(slot) } else { None }
 }
 
 fn spawn_many(n: usize) -> usize {
@@ -491,6 +570,7 @@ fn handle_command(line: &str) {
             println!("  tasks         - show thread table with state");
             println!("  el            - show current exception level");
             println!("  regs          - dump CPU state");
+            println!("  irqs          - show interrupt counts");
             println!("  echo <text>   - print text back");
             println!("  sleep <ms>    - sleep for N milliseconds");
             println!("  mem <addr>    - dump 128 bytes at hex addr");
@@ -541,6 +621,10 @@ fn handle_command(line: &str) {
             println!("ELR_EL1:   {:#018x}", read_elr());
             println!("SPSR_EL1:  {:#018x}", read_spsr());
             println!("CurrentEL: EL{}", current_el());
+        }
+        "irqs" => {
+            println!("Timer IRQs: {}", TICKS.load(Ordering::Relaxed));
+            println!("UART IRQs:  {}", UART_IRQS.load(Ordering::Relaxed));
         }
         "echo" => println!("{}", args),
         "sleep" => {
@@ -619,15 +703,23 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("=================================");
-    println!("     AdityaOS Shell v1.3");
-    println!("     N-Slot Thread Table");
+    println!("     AdityaOS Shell v1.4");
+    println!("    UART RX Interrupts");
     println!("=================================");
     println!();
 
     shell_prompt();
 
     loop {
-        let c = uart_getc();
+        // Non-blocking read. If no byte, yield to the scheduler.
+        let c = match uart_try_getc() {
+            Some(b) => b,
+            None => {
+                sleep_ms(5);
+                continue;
+            }
+        };
+
         match c {
             0x0D | 0x0A => {
                 println!();
@@ -684,14 +776,12 @@ pub extern "C" fn rust_irq_handler(current: *mut Context) -> *const Context {
 
         if (t % 2) == 0 {
             SWITCHES.fetch_add(1, Ordering::Relaxed);
-
             let cur = CURRENT.load(Ordering::Relaxed);
             unsafe {
                 if STATE[cur] == ThreadState::Running {
                     STATE[cur] = ThreadState::Ready;
                 }
             }
-
             let mut nxt = cur;
             unsafe {
                 for step in 1..=MAX_THREADS {
@@ -706,6 +796,8 @@ pub extern "C" fn rust_irq_handler(current: *mut Context) -> *const Context {
             }
             CURRENT.store(nxt, Ordering::Relaxed);
         }
+    } else if id == IRQ_UART0 {
+        uart_handle_irq();
     }
 
     mmio_write32(GICC_EOIR, iar);
@@ -729,8 +821,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.3\n", 3);
-    print_slow("    N-Slot Thread Table\n", 3);
+    print_slow("       AdityaOS v1.4\n", 3);
+    print_slow("    UART RX Interrupts\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
@@ -756,6 +848,8 @@ pub extern "C" fn kmain() -> ! {
     timer_init();
     println!("Setting up scheduler...");
     sched_init();
+    println!("Enabling UART RX interrupts...");
+    uart_enable_rx_irq();
     println!("Enabling IRQs...");
     enable_irqs();
     println!();
