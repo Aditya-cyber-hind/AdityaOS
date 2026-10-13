@@ -255,6 +255,7 @@ const DESC_VALID:  u64 = 1 << 0;
 const DESC_TABLE:  u64 = 1 << 1;
 const DESC_AF:     u64 = 1 << 10;
 const DESC_SH_INNER: u64 = 0b11 << 8;
+const DESC_AP_USER: u64 = 1 << 6;    // AP[1]=1, AP[2]=0 -> EL0 RW, EL1 RW
 
 const DESC_ATTR_NORMAL: u64 = 0 << 2;
 const DESC_ATTR_DEVICE: u64 = 1 << 2;
@@ -265,6 +266,7 @@ const BLOCK_DEVICE: u64 = DESC_VALID | DESC_AF | DESC_ATTR_DEVICE;
 const TABLE_ENTRY: u64 = DESC_VALID | DESC_TABLE;
 const NEXT_TABLE: u64 = DESC_VALID | DESC_TABLE | DESC_AF;
 const L3_PAGE_NORMAL: u64 = DESC_VALID | DESC_TABLE | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL;
+const L3_PAGE_USER: u64 = DESC_VALID | DESC_TABLE | DESC_AF | DESC_SH_INNER | DESC_ATTR_NORMAL | DESC_AP_USER;
 
 #[repr(C, align(4096))]
 struct PageTable([u64; 512]);
@@ -357,7 +359,8 @@ fn tt_thread_l0_phys(idx: usize) -> usize {
     }
 }
 
-fn thread_map_page(thread_idx: usize, vaddr: u64, paddr: u64) -> bool {
+/// Map a page as EL1-only (for kernel testing) or EL0-accessible (for user).
+fn thread_map_page_attr(thread_idx: usize, vaddr: u64, paddr: u64, user: bool) -> bool {
     if thread_idx >= MAX_THREADS { return false; }
 
     let l0_idx = ((vaddr >> 39) & 0x1FF) as usize;
@@ -380,7 +383,8 @@ fn thread_map_page(thread_idx: usize, vaddr: u64, paddr: u64) -> bool {
 
         *l2.add(l2_idx) = (l3 as u64) | NEXT_TABLE;
 
-        *l3.add(l3_idx) = (paddr & !0xFFFu64) | L3_PAGE_NORMAL;
+        let page_desc = if user { L3_PAGE_USER } else { L3_PAGE_NORMAL };
+        *l3.add(l3_idx) = (paddr & !0xFFFu64) | page_desc;
 
         core::arch::asm!("dsb ish", options(nostack, nomem));
         core::arch::asm!("tlbi vmalle1", options(nostack, nomem));
@@ -388,6 +392,14 @@ fn thread_map_page(thread_idx: usize, vaddr: u64, paddr: u64) -> bool {
         core::arch::asm!("isb", options(nostack, nomem));
     }
     true
+}
+
+fn thread_map_page(thread_idx: usize, vaddr: u64, paddr: u64) -> bool {
+    thread_map_page_attr(thread_idx, vaddr, paddr, false)
+}
+
+fn thread_map_user_page(thread_idx: usize, vaddr: u64, paddr: u64) -> bool {
+    thread_map_page_attr(thread_idx, vaddr, paddr, true)
 }
 
 fn set_ttbr0(phys: u64) {
@@ -1137,6 +1149,218 @@ fn spawn_vm_demo() -> Option<usize> {
 }
 
 // ============================================================
+// User mode — v1.17f (working EL0 + syscalls)
+// ============================================================
+
+const USER_CODE_BASE:  u64 = 0x80_0000_0000 + 0x100_0000;
+const USER_STACK_BASE: u64 = 0x80_0000_0000 + 0x200_0000;
+const USER_STACK_SIZE: u64 = 0x1000;
+const USER_DATA_BASE:  u64 = 0x80_0000_0000 + 0x300_0000;
+
+// User program (assembled to raw bytes):
+//
+//   // sys_write(1, msg, msg_len)
+//   mov x0, #1
+//   adr x1, msg
+//   mov x2, #MSG_LEN
+//   mov x8, #64
+//   svc #0
+//
+//   // sys_exit(0)
+//   mov x0, #0
+//   mov x8, #93
+//   svc #0
+//
+//   msg: .ascii "Hello from EL0!\n"
+//
+// Assembled bytes below. Offsets computed to keep msg at a known
+// location within the page.
+
+const USER_MSG: &[u8] = b"Hello from EL0!\n";
+const USER_MSG_LEN: usize = 15;
+
+// Hand-assembled. Each instruction is a 4-byte little-endian word.
+// Layout:
+//   0x00: mov x0, #1                -> 20 00 80 d2
+//   0x04: adr x1, #(msg_offset)     -> compute below
+//   0x08: mov x2, #15               -> e2 01 80 d2
+//   0x0c: mov x8, #64               -> 08 08 80 d2
+//   0x10: svc #0                    -> 01 00 00 d4
+//   0x14: mov x0, #0                -> 00 00 80 d2
+//   0x18: mov x8, #93               -> a8 0b 80 d2
+//   0x1c: svc #0                    -> 01 00 00 d4
+//   0x20: (padding, up to 0x40)
+//   0x40: "Hello from EL0!\n"
+//
+// ADR encodes a signed 21-bit offset in units of 4 bytes, split across
+// two fields. The PC value used is the address of the ADR instruction.
+// ADR x1, #0x40 (at PC=0x04) means relative offset = 0x40 - 0x04 = 0x3c.
+// 0x3c >> 2 = 0xf.
+// ADR encoding: op=0, immlo[2:0], 1 0000, immhi[20:5], Rd
+// So instruction word = 0b0_00_10000_00000000000000001111_00001
+// = 0x100000e1
+const USER_PROG_SIZE: usize = 0xA0;
+
+static USER_PROG: [u8; 0xA0] = [
+    // 0x00: mov x0, #1
+    0x00, 0x00, 0x20, 0xd4,
+    // 0x04: adr x1, #0x40
+    0xe1, 0x00, 0x00, 0x10,
+    // 0x08: mov x2, #15
+    0xe2, 0x01, 0x80, 0xd2,
+    // 0x0c: mov x8, #64
+    0x08, 0x08, 0x80, 0xd2,
+    // 0x10: svc #0
+    0x01, 0x00, 0x00, 0xd4,
+    // 0x14: mov x0, #0
+    0x00, 0x00, 0x80, 0xd2,
+    // 0x18: mov x8, #93
+    0xa8, 0x0b, 0x80, 0xd2,
+    // 0x1c: svc #0
+    0x01, 0x00, 0x00, 0xd4,
+    // 0x20..0x3f: padding
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    // 0x40: "Hello from EL0!\n" (15 bytes, then padding to 0x80)
+    0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x66, 0x72,
+    0x6f, 0x6d, 0x20, 0x45, 0x4c, 0x30, 0x21, 0x0a,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+];
+
+fn is_user_addr(addr: u64, len: u64) -> bool {
+    // Accept pointers into USER_CODE, USER_STACK, or USER_DATA regions
+    // We only map one page each, so check the range.
+    if len == 0 { return true; }
+    let end = match addr.checked_add(len) { Some(e) => e, None => return false };
+    // Code region
+    if addr >= USER_CODE_BASE && end <= USER_CODE_BASE + 0x1000 { return true; }
+    // Stack region
+    if addr >= USER_STACK_BASE && end <= USER_STACK_BASE + USER_STACK_SIZE { return true; }
+    // Data region
+    if addr >= USER_DATA_BASE && end <= USER_DATA_BASE + 0x1000 { return true; }
+    false
+}
+
+fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
+    // Validate buffer range
+    if !is_user_addr(buf, len) {
+        return (-14i64) as u64; // -EFAULT
+    }
+    if fd != 1 && fd != 2 {
+        return (-9i64) as u64; // -EBADF
+    }
+
+    // Read from user memory and echo to UART
+    let mut i = 0u64;
+    while i < len {
+        let b = unsafe { core::ptr::read_volatile((buf + i) as *const u8) };
+        if b == b'\n' { Uart.putc(b'\r'); }
+        Uart.putc(b);
+        i += 1;
+    }
+    len
+}
+
+fn sys_exit(code: u64) -> u64 {
+    let me = CURRENT.load(Ordering::Relaxed);
+    println!("{}[kernel] user thread {} exited with code {}{}", GREEN, me, code, RESET);
+    unsafe {
+        STATE[me] = ThreadState::Dead;
+    }
+    // Spin. The scheduler will never return here because we're Dead.
+    loop { core::hint::spin_loop(); }
+}
+
+fn syscall_dispatch(nr: u64, x0: u64, x1: u64, x2: u64) -> u64 {
+    match nr {
+        64 => sys_write(x0, x1, x2),
+        93 => sys_exit(x0),
+        _ => {
+            println!("{}[kernel] unknown syscall {}{}", RED, nr, RESET);
+            (-38i64) as u64 // -ENOSYS
+        }
+    }
+}
+
+/// Spawn a thread that runs in EL0.
+fn spawn_user_thread() -> Option<usize> {
+    let slot = find_free_spawn_slot()?;
+    let stack_base = spawn_stack_base(slot)?;
+
+    // Wipe this thread's private page tables
+    unsafe {
+        let l1 = core::ptr::addr_of_mut!(TT_THREAD_L1[slot]) as *mut u64;
+        let l2 = core::ptr::addr_of_mut!(TT_THREAD_L2[slot]) as *mut u64;
+        let l3 = core::ptr::addr_of_mut!(TT_THREAD_L3[slot]) as *mut u64;
+        for i in 0..512 {
+            *l1.add(i) = 0;
+            *l2.add(i) = 0;
+            *l3.add(i) = 0;
+        }
+    }
+
+    // Allocate physical pages for code, stack, data
+    let code_page = kmalloc(4096, 4096);
+    let stack_page = kmalloc(4096, 4096);
+    let data_page = kmalloc(4096, 4096);
+
+    if code_page.is_null() || stack_page.is_null() || data_page.is_null() {
+        println!("{}userstart: kmalloc failed{}", RED, RESET);
+        return None;
+    }
+
+    // Copy user program into code page
+    unsafe {
+        let mut i = 0;
+        while i < USER_PROG_SIZE {
+            core::ptr::write_volatile(code_page.add(i), USER_PROG[i]);
+            i += 1;
+        }
+    }
+    // Debug: dump first 32 bytes of the code page
+    print!("  code[0..32]: ");
+    for i in 0..32 {
+        let b = unsafe { core::ptr::read_volatile(code_page.add(i)) };
+        print!("{:02x} ", b);
+    }
+    println!();
+
+    // Map as user-accessible
+    if !thread_map_user_page(slot, USER_CODE_BASE, code_page as u64) {
+        println!("{}userstart: map code failed{}", RED, RESET);
+        return None;
+    }
+    if !thread_map_user_page(slot, USER_STACK_BASE, stack_page as u64) {
+        println!("{}userstart: map stack failed{}", RED, RESET);
+        return None;
+    }
+    if !thread_map_user_page(slot, USER_DATA_BASE, data_page as u64) {
+        println!("{}userstart: map data failed{}", RED, RESET);
+        return None;
+    }
+
+    // Set up thread context for EL0
+    unsafe {
+        CTX[slot].sp = stack_base as u64 + STACK_SIZE as u64;  // kernel stack for traps
+        CTX[slot].sp_el0 = USER_STACK_BASE + USER_STACK_SIZE;  // user stack top
+        CTX[slot].elr = USER_CODE_BASE;                        // user entry PC
+        CTX[slot].spsr = 0x3C0;                                // EL0t, DAIF masked                                  // EL0t
+        CTX[slot].wake_at = 0;
+        STATE[slot] = ThreadState::Ready;
+    }
+
+    println!("  code page phys:  {:#x}", code_page as u64);
+    println!("  stack page phys: {:#x}", stack_page as u64);
+    println!("  data page phys:  {:#x}", data_page as u64);
+
+    Some(slot)
+}
+
+// ============================================================
 // Shell
 // ============================================================
 
@@ -1261,6 +1485,7 @@ const COMMANDS: &[&str] = &[
     "alloc", "heap", "vmtest", "vmdemo", "vminfo", "tlb", "ttbr", "mkfs", "touch",
     "writef", "append", "cat", "ls", "rm", "stat", "fsinfo", "cp", "mv", "head", "wc",
     "echo", "sleep", "history", "spam", "sh", "halt", "shutdown", "reboot", "panic",
+    "userstart", "userinfo",
 ];
 
 const FILE_COMMANDS: &[&str] = &[
@@ -1468,6 +1693,9 @@ fn handle_command(line: &str) {
             println!("  vminfo                   - show last vmdemo results");
             println!("  tlb <idx> <vaddr> <paddr> - map vaddr->paddr for thread idx");
             println!("  ttbr <idx>               - show thread's TTBR0");
+            println!("  {}=== user mode ==={}", YELLOW, RESET);
+            println!("  userstart                - spawn a user thread at EL0");
+            println!("  userinfo                 - show user space layout");
             println!("  {}=== filesystem ==={}", YELLOW, RESET);
             println!("  mkfs                     - format RAM filesystem");
             println!("  touch <name>             - create empty file");
@@ -1525,14 +1753,14 @@ fn handle_command(line: &str) {
             println!("Switches: {}", SWITCHES.load(Ordering::Relaxed));
         }
         "tasks" => {
-            println!("Idx  State    WakeAt             SP                 TTBR0");
-            println!("---  -------  -----------------  -----------------  -----------------");
+            println!("Idx  State    SPSR   SP                 TTBR0");
+            println!("---  -------  -----  -----------------  -----------------");
             unsafe {
                 for i in 0..MAX_THREADS {
                     let s = STATE[i];
                     if s == ThreadState::Unused { continue; }
-                    println!("{:>3}  {:<7}  {:<17}  {:#018x}  {:#018x}",
-                        i, state_name(s), CTX[i].wake_at, CTX[i].sp, tt_thread_l0_phys(i));
+                    println!("{:>3}  {:<7}  {:#05x}  {:#018x}  {:#018x}",
+                        i, state_name(s), CTX[i].spsr, CTX[i].sp, tt_thread_l0_phys(i));
                 }
             }
         }
@@ -1816,6 +2044,28 @@ fn handle_command(line: &str) {
                     println!("{:>3}  {:#018x}", i, DEMO_PHYS[i]);
                 }
             }
+        }
+        "userstart" => {
+            match spawn_user_thread() {
+                Some(idx) => {
+                    println!("{}Spawned user thread in slot {}{}", GREEN, idx, RESET);
+                    println!("  Code  VA: {:#x}", USER_CODE_BASE);
+                    println!("  Stack VA: {:#x}", USER_STACK_BASE);
+                    println!("  Data  VA: {:#x}", USER_DATA_BASE);
+                    println!("  Entry PC: {:#x}  SPSR: 0x0 (EL0t)", USER_CODE_BASE);
+                    println!("  Watching for output from EL0...");
+                }
+                None => println!("{}No free spawn slots.{}", RED, RESET),
+            }
+        }
+        "userinfo" => {
+            println!("{}User space layout:{}", BOLD, RESET);
+            println!("  Code   base: {:#x} (size 4KB)", USER_CODE_BASE);
+            println!("  Stack  base: {:#x} (size 4KB)", USER_STACK_BASE);
+            println!("  Data   base: {:#x} (size 4KB)", USER_DATA_BASE);
+            println!("  User program size: {} bytes", USER_PROG_SIZE);
+            println!("  Syscalls implemented: write (64), exit (93)");
+            println!("  ABI: Linux AArch64 (x8 = nr, x0-x5 = args, x0 = ret)");
         }
         "mkfs" => {
             fs_format();
@@ -2178,8 +2428,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("{}================================={}", CYAN, RESET);
-    println!("{}     AdityaOS Shell v1.17b{}", BOLD, RESET);
-    println!("{}   SVC Handler Installed{}", CYAN, RESET);
+    println!("{}     AdityaOS Shell v1.17f{}", BOLD, RESET);
+    println!("{}     User Mode Enabled{}", CYAN, RESET);
     println!("{}================================={}", CYAN, RESET);
     println!();
 
@@ -2413,20 +2663,24 @@ extern "C" fn shell_thread() -> ! {
 // ============================================================
 
 /// Called from boot.S when EL0 code executes `svc`.
-/// `svc_imm` = the immediate from the svc instruction (ESR_EL1[15:0])
-/// `ctx` = pointer to the current thread's Context
-/// Returns the value to place into the user's x0 register.
 #[no_mangle]
-pub extern "C" fn rust_svc_handler(svc_imm: u64, _ctx: *mut Context) -> u64 {
-    // No EL0 threads exist yet — this should never fire.
-    println!();
-    println!("{}=== SVC received ==={}", YELLOW, RESET);
-    println!("  svc immediate: {}", svc_imm);
-    println!("  But no EL0 threads exist yet!");
-    println!("  This should not happen.");
-    println!();
-    println!("System halted.");
-    loop { core::hint::spin_loop(); }
+pub extern "C" fn rust_svc_handler(svc_imm: u64, ctx: *mut Context) -> u64 {
+    let c = unsafe { &*ctx };
+
+    let esr: u64;
+    unsafe { core::arch::asm!("mrs {}, esr_el1", out(reg) esr, options(nostack, nomem)); }
+    let ec = (esr >> 26) & 0x3F;
+
+    println!("{}[svc] EC={:#x} imm={} x0={:#x} x8={:#x} elr={:#x}{}",
+        CYAN, ec, svc_imm, c.x[0], c.x[8], c.elr, RESET);
+
+    if ec != 0x15 {
+        println!("{}[svc] NOT AN SVC. EC={:#x}. Halting.{}", RED, ec, RESET);
+        loop { core::hint::spin_loop(); }
+    }
+
+    let ret = syscall_dispatch(c.x[8], c.x[0], c.x[1], c.x[2]);
+    ret
 }
 
 #[no_mangle]
@@ -2437,12 +2691,39 @@ pub extern "C" fn rust_exception_handler(esr: u64, elr: u64, far: u64) {
     println!("  ELR_EL1: {:#018x}", elr);
     println!("  FAR_EL1: {:#018x}", far);
     let ec = (esr >> 26) & 0x3F;
-    println!("  EC: {:#x}", ec);
-    if ec == 0x24 || ec == 0x25 {
-        let dfsc = esr & 0x3F;
-        println!("  DFSC: {:#x}", dfsc);
+    let iss = esr & 0x01FF_FFFF;
+    println!("  EC:  {:#x}", ec);
+    println!("  ISS: {:#x}", iss);
+
+    // Decode common exception classes
+    match ec {
+        0x00 => println!("  type: Unknown"),
+        0x01 => println!("  type: WFI/WFE trap"),
+        0x07 => println!("  type: FP/SIMD trap"),
+        0x0E => println!("  type: Illegal execution state"),
+        0x15 => println!("  type: SVC from AArch64"),
+        0x20 => {
+            println!("  type: Instruction abort from lower EL");
+            let dfsc = esr & 0x3F;
+            println!("  DFSC: {:#x} (0x07=level 3 trans, 0x0f=perm)", dfsc);
+        }
+        0x21 => println!("  type: Instruction abort from same EL"),
+        0x22 => println!("  type: PC alignment fault"),
+        0x24 => {
+            println!("  type: Data abort from lower EL");
+            let dfsc = esr & 0x3F;
+            let wnr = (esr >> 6) & 1;
+            println!("  DFSC: {:#x} (0x07=level 3 trans, 0x0f=perm)", dfsc);
+            println!("  WnR:  {} ({})", wnr, if wnr == 1 { "write" } else { "read" });
+        }
+        0x25 => println!("  type: Data abort from same EL"),
+        0x26 => println!("  type: SP alignment fault"),
+        _    => println!("  type: other"),
     }
+
+    println!();
     println!("System halted.");
+    loop { core::hint::spin_loop(); }
 }
 
 #[no_mangle]
@@ -2517,8 +2798,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.17b\n", 3);
-    print_slow("   SVC Handler Installed\n", 3);
+    print_slow("       AdityaOS v1.17f\n", 3);
+    print_slow("     User Mode Enabled\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());

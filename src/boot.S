@@ -215,6 +215,7 @@ exc_svc:
 
     // Save ELR_EL1 (user PC) and SPSR_EL1 (user PSTATE)
     mrs x0, elr_el1
+    add x0, x0, #4
     str x0, [x9, #0x100]
     mrs x0, spsr_el1
     str x0, [x9, #0x108]
