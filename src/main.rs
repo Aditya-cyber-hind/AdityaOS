@@ -39,6 +39,20 @@ impl SpinLock {
 static UART_LOCK: SpinLock = SpinLock::new();
 
 // ============================================================
+// ANSI color codes
+// ============================================================
+
+const RESET:   &str = "\x1b[0m";
+const BOLD:    &str = "\x1b[1m";
+const RED:     &str = "\x1b[31m";
+const GREEN:   &str = "\x1b[32m";
+const YELLOW:  &str = "\x1b[33m";
+const BLUE:    &str = "\x1b[34m";
+const MAGENTA: &str = "\x1b[35m";
+const CYAN:    &str = "\x1b[36m";
+const WHITE:   &str = "\x1b[37m";
+
+// ============================================================
 // UART
 // ============================================================
 
@@ -655,6 +669,63 @@ fn fs_write(idx: usize, data: &[u8]) -> Result<usize, &'static str> {
     }
 }
 
+fn fs_append(idx: usize, data: &[u8]) -> Result<usize, &'static str> {
+    unsafe {
+        if idx >= FS_MAX_FILES || FS.inodes[idx].node_type == FsNodeType::Empty {
+            return Err("invalid file");
+        }
+
+        let old_size = FS.inodes[idx].size;
+        let new_size = old_size + data.len();
+        let needed_blocks = (new_size + FS_BLOCK_SIZE - 1) / FS_BLOCK_SIZE;
+
+        if needed_blocks > FS_MAX_BLOCKS_PER_FILE {
+            return Err("file too large (max 4 blocks = 2KB)");
+        }
+
+        // Determine current block count (may need to grow)
+        let old_block_count = FS.inodes[idx].block_count;
+
+        // Allocate new blocks if needed
+        let mut block_num = old_block_count;
+        while block_num < needed_blocks {
+            let blk = match fs_find_free_block() {
+                Some(b) => b,
+                None => return Err("out of disk space"),
+            };
+            FS.inodes[idx].blocks[block_num] = blk as u16;
+            block_num += 1;
+        }
+
+        // Write bytes at old_size position
+        let mut remaining = data.len();
+        let mut src_off = 0;
+        let mut pos = old_size;
+
+        while remaining > 0 {
+            let blk_idx = pos / FS_BLOCK_SIZE;
+            let off_in_blk = pos % FS_BLOCK_SIZE;
+            let blk = FS.inodes[idx].blocks[blk_idx] as usize;
+            let to_copy = {
+                let space_left = FS_BLOCK_SIZE - off_in_blk;
+                if remaining > space_left { space_left } else { remaining }
+            };
+            let mut j = 0;
+            while j < to_copy {
+                FS.blocks[blk][off_in_blk + j] = data[src_off + j];
+                j += 1;
+            }
+            pos += to_copy;
+            src_off += to_copy;
+            remaining -= to_copy;
+        }
+
+        FS.inodes[idx].block_count = block_num;
+        FS.inodes[idx].size = new_size;
+        Ok(data.len())
+    }
+}
+
 fn fs_read(idx: usize, out: &mut [u8]) -> Result<usize, &'static str> {
     unsafe {
         if idx >= FS_MAX_FILES || FS.inodes[idx].node_type == FsNodeType::Empty {
@@ -1032,10 +1103,11 @@ extern "C" fn vm_demo_thread() -> ! {
     };
 
     if readback == pattern {
-        println!("[vm-demo {}] read back {:#018x}  OK (isolation works)", me, readback);
+        println!("{}[vm-demo {}] read back {:#018x}  OK (isolation works){}",
+            GREEN, me, readback, RESET);
     } else {
-        println!("[vm-demo {}] read back {:#018x}  WRONG (expected {:#018x})",
-            me, readback, pattern);
+        println!("{}[vm-demo {}] read back {:#018x}  WRONG (expected {:#018x}){}",
+            RED, me, readback, pattern, RESET);
     }
 
     thread_exit();
@@ -1071,7 +1143,7 @@ fn spawn_vm_demo() -> Option<usize> {
 // ============================================================
 
 const MAX_LINE: usize = 128;
-const HISTORY_SIZE: usize = 8;
+const HISTORY_SIZE: usize = 16;
 
 static mut HISTORY: [[u8; MAX_LINE]; HISTORY_SIZE] = [[0; MAX_LINE]; HISTORY_SIZE];
 static HISTORY_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1090,19 +1162,16 @@ fn history_push(line: &str) {
     HISTORY_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-fn shell_prompt() { print!("adityaos> "); }
+fn shell_prompt() { print!("{}adityaos>{} ", CYAN, RESET); }
 
-/// Redraw the current input line: carriage return, clear line, prompt, buffer.
-/// Also positions cursor at `cursor` position if `cursor < len`.
 fn redraw_line(buf: &[u8], len: usize, cursor: usize) {
     print!("\r\x1b[2K");
-    print!("adityaos> ");
+    print!("{}adityaos>{} ", CYAN, RESET);
     let mut i = 0;
     while i < len {
         Uart.putc(buf[i]);
         i += 1;
     }
-    // If cursor is not at the end, move back
     if cursor < len {
         let back = len - cursor;
         let mut j = 0;
@@ -1113,8 +1182,6 @@ fn redraw_line(buf: &[u8], len: usize, cursor: usize) {
     }
 }
 
-/// Get the Nth-from-end history entry. `offset` = 0 means most recent.
-/// Returns the entry as a slice reference into the global HISTORY array.
 unsafe fn history_get(offset: usize) -> Option<&'static [u8]> {
     let total = HISTORY_COUNT.load(Ordering::Relaxed);
     if offset >= total.min(HISTORY_SIZE) { return None; }
@@ -1190,6 +1257,228 @@ fn strlen_at(addr: u64) -> usize {
     n
 }
 
+// ============================================================
+// Command table (for tab completion)
+// ============================================================
+
+const COMMANDS: &[&str] = &[
+    "help", "clear", "ticks", "uptime", "time", "threads", "tasks", "el", "regs", "irqs",
+    "mmu", "ptdump", "spawn", "spawnmany", "mem", "dump", "write", "memset", "strlen",
+    "alloc", "heap", "vmtest", "vmdemo", "vminfo", "tlb", "ttbr", "mkfs", "touch",
+    "writef", "append", "cat", "ls", "rm", "stat", "fsinfo", "cp", "mv", "head", "wc",
+    "echo", "sleep", "history", "spam", "sh", "halt", "shutdown", "reboot", "panic",
+];
+
+/// Commands that take a filename as their first argument
+const FILE_COMMANDS: &[&str] = &[
+    "cat", "rm", "stat", "writef", "append", "head", "wc", "cp", "mv", "sh",
+];
+
+/// Tab completion. Given the current buffer contents, return a completed version.
+/// Called when Tab (0x09) is pressed.
+/// Returns (new_buf, new_len, new_cursor).
+fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
+    // Split into first word (command) and rest
+    let mut first_space = len;
+    let mut i = 0;
+    while i < len {
+        if buf[i] == b' ' {
+            first_space = i;
+            break;
+        }
+        i += 1;
+    }
+
+    if first_space == len {
+        // Only one word so far — complete command name
+        let prefix = unsafe { core::str::from_utf8_unchecked(&buf[..len]) };
+        if prefix.is_empty() { return (len, len); }
+
+        // Find all matches
+        let mut matches: [&str; 8] = [""; 8];
+        let mut match_count = 0;
+        for cmd in COMMANDS {
+            if cmd.starts_with(prefix) {
+                if match_count < 8 {
+                    matches[match_count] = cmd;
+                    match_count += 1;
+                }
+            }
+        }
+
+        if match_count == 0 {
+            // No match — bell
+            Uart.putc(0x07);
+            return (len, len);
+        } else if match_count == 1 {
+            // Unique match — replace the buffer
+            let m = matches[0];
+            let bytes = m.as_bytes();
+            let new_len = bytes.len();
+            // Copy to buffer... but we can't write to buf here since it's &[u8]
+            // We'll do the writing in the caller instead.
+            // Return new_len as a signal; the caller will redraw.
+            // For simplicity, we print the completion directly and return the new length.
+            // Move cursor back to start of word
+            let mut j = 0;
+            while j < len {
+                print!("\x1b[D");
+                j += 1;
+            }
+            // Print the completion
+            let mut k = 0;
+            while k < new_len {
+                Uart.putc(bytes[k]);
+                k += 1;
+            }
+            return (new_len, new_len);
+        } else {
+            // Multiple matches — print them below
+            println!();
+            let mut j = 0;
+            while j < match_count {
+                print!("{}  ", matches[j]);
+                j += 1;
+            }
+            println!();
+            // Redraw prompt + current buffer
+            print!("{}adityaos>{} ", CYAN, RESET);
+            let mut k = 0;
+            while k < len {
+                Uart.putc(buf[k]);
+                k += 1;
+            }
+            return (len, len);
+        }
+    } else {
+        // We have "command arg..." — complete filename if command expects one
+        let cmd = unsafe { core::str::from_utf8_unchecked(&buf[..first_space]) };
+        if !FILE_COMMANDS.contains(&cmd) {
+            Uart.putc(0x07);
+            return (len, len);
+        }
+
+        // Find the current partial argument (after last space)
+        let mut arg_start = first_space + 1;
+        let mut j = first_space + 1;
+        while j < len {
+            if buf[j] == b' ' {
+                arg_start = j + 1;
+            }
+            j += 1;
+        }
+
+        // Only complete the first arg for now
+        if arg_start != first_space + 1 {
+            Uart.putc(0x07);
+            return (len, len);
+        }
+
+        let partial = unsafe { core::str::from_utf8_unchecked(&buf[arg_start..len]) };
+
+        // Find matching filenames
+        let mut found_first = false;
+        let mut unique_match = false;
+        let mut match_name: [u8; 32] = [0; 32];
+        let mut match_name_len = 0;
+        let mut match_count = 0;
+
+        unsafe {
+            for k in 0..FS_MAX_FILES {
+                if FS.inodes[k].node_type == FsNodeType::Empty { continue; }
+                let name_len = FS.inodes[k].name_len;
+                let name_bytes = &FS.inodes[k].name[..name_len];
+                let name_str = core::str::from_utf8_unchecked(name_bytes);
+                if name_str.starts_with(partial) {
+                    match_count += 1;
+                    if !found_first {
+                        found_first = true;
+                        match_name_len = name_len;
+                        let mut m = 0;
+                        while m < name_len && m < 32 {
+                            match_name[m] = name_bytes[m];
+                            m += 1;
+                        }
+                    } else {
+                        unique_match = false;
+                    }
+                }
+            }
+        }
+
+        if match_count == 0 {
+            Uart.putc(0x07);
+            return (len, len);
+        } else if match_count == 1 && unique_match {
+            // Print the completion (rest of the name)
+            let to_print = match_name_len - partial.len();
+            let mut m = partial.len();
+            while m < match_name_len {
+                Uart.putc(match_name[m]);
+                m += 1;
+            }
+            let _ = to_print;
+            return (match_name_len + arg_start, match_name_len + arg_start);
+        } else if match_count == 1 {
+            // Found exactly one match (unique_match was false because we didn't loop a second time)
+            let to_print = match_name_len - partial.len();
+            let mut m = partial.len();
+            while m < match_name_len {
+                Uart.putc(match_name[m]);
+                m += 1;
+            }
+            let _ = to_print;
+            return (match_name_len + arg_start, match_name_len + arg_start);
+        } else {
+            // Multiple matches — bell only, to keep it simple
+            Uart.putc(0x07);
+            return (len, len);
+        }
+    }
+}
+
+// ============================================================
+// Script runner
+// ============================================================
+
+fn run_script(name: &str) -> Result<(), &'static str> {
+    if !fs_is_formatted() {
+        return Err("filesystem not formatted");
+    }
+    let idx = match fs_find(name) {
+        Some(i) => i,
+        None => return Err("script not found"),
+    };
+
+    let size = unsafe { FS.inodes[idx].size };
+    if size == 0 {
+        return Err("empty script");
+    }
+    if size > 2048 {
+        return Err("script too large");
+    }
+
+    let mut buf = [0u8; 2048];
+    match fs_read(idx, &mut buf) {
+        Ok(n) => {
+            let script = unsafe { core::str::from_utf8_unchecked(&buf[..n]) };
+            for line in script.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+                if trimmed.starts_with('#') { continue; }
+                println!("{}>>> {}{}", YELLOW, trimmed, RESET);
+                handle_command(trimmed);
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// ============================================================
+// Command dispatch
+// ============================================================
+
 fn handle_command(line: &str) {
     let trimmed = line.trim();
     if trimmed.is_empty() { return; }
@@ -1201,8 +1490,8 @@ fn handle_command(line: &str) {
 
     match cmd {
         "help" => {
-            println!("AdityaOS shell commands:");
-            println!("  === system ===");
+            println!("{}AdityaOS shell commands:{}", BOLD, RESET);
+            println!("  {}=== system ==={}", YELLOW, RESET);
             println!("  help                     - show this message");
             println!("  clear                    - clear screen");
             println!("  ticks                    - timer tick count");
@@ -1212,12 +1501,12 @@ fn handle_command(line: &str) {
             println!("  irqs                     - interrupt counts");
             println!("  mmu                      - MMU registers");
             println!("  ptdump                   - kernel page table dump");
-            println!("  === threads ===");
+            println!("  {}=== threads ==={}", YELLOW, RESET);
             println!("  threads                  - thread/scheduler info");
             println!("  tasks                    - thread table");
             println!("  spawn                    - spawn lifecycle thread");
             println!("  spawnmany <n>            - spawn N threads");
-            println!("  === memory ===");
+            println!("  {}=== memory ==={}", YELLOW, RESET);
             println!("  mem <addr>               - dump 128 bytes");
             println!("  dump <addr> <len>        - dump len bytes");
             println!("  write <addr> <hexbytes>  - write hex bytes");
@@ -1225,29 +1514,36 @@ fn handle_command(line: &str) {
             println!("  strlen <addr>            - string length");
             println!("  alloc <size>             - allocate memory");
             println!("  heap                     - heap statistics");
-            println!("  === virtualization ===");
+            println!("  {}=== virtualization ==={}", YELLOW, RESET);
             println!("  vmtest                   - setup isolation mappings");
             println!("  vmdemo                   - 2 threads, same VA, different data");
             println!("  vminfo                   - show last vmdemo results");
             println!("  tlb <idx> <vaddr> <paddr> - map vaddr->paddr for thread idx");
             println!("  ttbr <idx>               - show thread's TTBR0");
-            println!("  === filesystem ===");
+            println!("  {}=== filesystem ==={}", YELLOW, RESET);
             println!("  mkfs                     - format RAM filesystem");
             println!("  touch <name>             - create empty file");
             println!("  writef <name> <text>     - write text to file");
+            println!("  append <name> <text>     - append text to file");
             println!("  cat <name>               - print file contents");
+            println!("  head <name> [n]          - print first n lines (default 5)");
+            println!("  wc <name>                - count lines, words, bytes");
             println!("  ls                       - list files");
+            println!("  cp <src> <dst>           - copy file");
+            println!("  mv <src> <dst>           - rename file");
             println!("  rm <name>                - delete file");
             println!("  stat <name>              - file info");
             println!("  fsinfo                   - filesystem statistics");
-            println!("  === terminal shortcuts ===");
+            println!("  sh <script>              - run a script from the filesystem");
+            println!("  {}=== terminal shortcuts ==={}", YELLOW, RESET);
+            println!("  Tab                      - complete command or filename");
             println!("  Up/Down                  - history navigation");
             println!("  Ctrl+A / Ctrl+E          - move cursor to start/end");
             println!("  Ctrl+U                   - clear line");
             println!("  Ctrl+W                   - delete last word");
             println!("  Ctrl+L                   - clear screen");
             println!("  Ctrl+C                   - cancel line");
-            println!("  === misc ===");
+            println!("  {}=== misc ==={}", YELLOW, RESET);
             println!("  echo <text>              - print text");
             println!("  sleep <ms>               - busy-wait sleep");
             println!("  history                  - command history");
@@ -1310,14 +1606,14 @@ fn handle_command(line: &str) {
                 sleep_ms(ms);
                 println!("Awake.");
             } else {
-                println!("Usage: sleep <ms>");
+                println!("{}Usage: sleep <ms>{}", RED, RESET);
             }
         }
         "mem" => {
             if let Some(addr) = parse_hex(args) {
                 dump_hex_ascii(addr, 128);
             } else {
-                println!("Usage: mem <hex address>");
+                println!("{}Usage: mem <hex address>{}", RED, RESET);
             }
         }
         "dump" => {
@@ -1328,7 +1624,7 @@ fn handle_command(line: &str) {
             let len = parse_u64(len_str);
             match (addr, len) {
                 (Some(a), Some(l)) if l > 0 && l <= 4096 => dump_hex_ascii(a, l as usize),
-                _ => println!("Usage: dump <hex addr> <len>"),
+                _ => println!("{}Usage: dump <hex addr> <len>{}", RED, RESET),
             }
         }
         "write" => {
@@ -1338,7 +1634,7 @@ fn handle_command(line: &str) {
             match parse_hex(addr_str) {
                 Some(addr) => {
                     if bytes_str.is_empty() || bytes_str.len() % 2 != 0 {
-                        println!("Usage: write <hex addr> <hexbytes>");
+                        println!("{}Usage: write <hex addr> <hexbytes>{}", RED, RESET);
                     } else {
                         let mut i = 0;
                         let mut ok = true;
@@ -1361,13 +1657,13 @@ fn handle_command(line: &str) {
                             i += 2;
                         }
                         if ok {
-                            println!("Wrote {} bytes at {:#x}", written, addr);
+                            println!("{}Wrote {} bytes at {:#x}{}", GREEN, written, addr, RESET);
                         } else {
-                            println!("write: invalid hex bytes");
+                            println!("{}write: invalid hex bytes{}", RED, RESET);
                         }
                     }
                 }
-                None => println!("Usage: write <hex addr> <hexbytes>"),
+                None => println!("{}Usage: write <hex addr> <hexbytes>{}", RED, RESET),
             }
         }
         "memset" => {
@@ -1387,9 +1683,9 @@ fn handle_command(line: &str) {
                         }
                         i += 1;
                     }
-                    println!("Filled {} bytes at {:#x} with 0x{:02x}", l, a, b);
+                    println!("{}Filled {} bytes at {:#x} with 0x{:02x}{}", GREEN, l, a, b, RESET);
                 }
-                _ => println!("Usage: memset <hex addr> <hex byte> <len>"),
+                _ => println!("{}Usage: memset <hex addr> <hex byte> <len>{}", RED, RESET),
             }
         }
         "strlen" => {
@@ -1397,7 +1693,7 @@ fn handle_command(line: &str) {
                 let n = strlen_at(addr);
                 println!("Length: {} bytes", n);
             } else {
-                println!("Usage: strlen <hex addr>");
+                println!("{}Usage: strlen <hex addr>{}", RED, RESET);
             }
         }
         "history" => {
@@ -1418,17 +1714,17 @@ fn handle_command(line: &str) {
         }
         "spawn" => {
             match spawn_lifecycle() {
-                Some(idx) => println!("Spawned lifecycle thread in slot {}", idx),
-                None => println!("No free spawn slots."),
+                Some(idx) => println!("{}Spawned lifecycle thread in slot {}{}", GREEN, idx, RESET),
+                None => println!("{}No free spawn slots.{}", RED, RESET),
             }
         }
         "spawnmany" => {
             if let Some(n) = parse_u64(args) {
                 let n = n.min(10) as usize;
                 let count = spawn_many(n);
-                println!("Spawned {} threads.", count);
+                println!("{}Spawned {} threads.{}", GREEN, count, RESET);
             } else {
-                println!("Usage: spawnmany <n>");
+                println!("{}Usage: spawnmany <n>{}", RED, RESET);
             }
         }
         "spam" => {
@@ -1438,26 +1734,26 @@ fn handle_command(line: &str) {
                     println!("[spam {:>3}/{}] AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                         i, n);
                 }
-                println!("[spam done]");
+                println!("{}[spam done]{}", GREEN, RESET);
             } else {
-                println!("Usage: spam <n>");
+                println!("{}Usage: spam <n>{}", RED, RESET);
             }
         }
         "alloc" => {
             if let Some(size) = parse_u64(args) {
                 let size = size as usize;
                 if size == 0 || size > HEAP_SIZE {
-                    println!("alloc: size must be 1..{}", HEAP_SIZE);
+                    println!("{}alloc: size must be 1..{}{}", RED, HEAP_SIZE, RESET);
                 } else {
                     let ptr = kmalloc(size, 16);
                     if ptr.is_null() {
-                        println!("alloc: out of memory");
+                        println!("{}alloc: out of memory{}", RED, RESET);
                     } else {
-                        println!("alloc: {} bytes at {:#018x}", size, ptr as usize);
+                        println!("{}alloc: {} bytes at {:#018x}{}", GREEN, size, ptr as usize, RESET);
                     }
                 }
             } else {
-                println!("Usage: alloc <bytes>");
+                println!("{}Usage: alloc <bytes>{}", RED, RESET);
             }
         }
         "heap" => {
@@ -1494,9 +1790,9 @@ fn handle_command(line: &str) {
             println!("SCTLR_EL1: {:#018x}", read_sctlr());
             let sctlr = read_sctlr();
             if (sctlr & 1) == 0 {
-                println!("MMU: OFF");
+                println!("{}MMU: OFF{}", RED, RESET);
             } else {
-                println!("MMU: ON");
+                println!("{}MMU: ON{}", GREEN, RESET);
             }
         }
         "ttbr" => {
@@ -1505,7 +1801,7 @@ fn handle_command(line: &str) {
                 if i < MAX_THREADS {
                     println!("Thread {} TTBR0 = {:#018x}", i, tt_thread_l0_phys(i));
                 } else {
-                    println!("Thread index must be 0..{}", MAX_THREADS);
+                    println!("{}Thread index must be 0..{}{}", RED, MAX_THREADS, RESET);
                 }
             } else {
                 for i in 0..MAX_THREADS {
@@ -1521,19 +1817,19 @@ fn handle_command(line: &str) {
             match (parse_u64(idx_s), parse_hex(va_s), parse_hex(pa_s)) {
                 (Some(i), Some(va), Some(pa)) if (i as usize) < MAX_THREADS => {
                     if thread_map_page(i as usize, va, pa) {
-                        println!("Mapped thread {} vaddr {:#x} -> paddr {:#x}", i, va, pa);
+                        println!("{}Mapped thread {} vaddr {:#x} -> paddr {:#x}{}", GREEN, i, va, pa, RESET);
                     } else {
-                        println!("tlb: mapping failed");
+                        println!("{}tlb: mapping failed{}", RED, RESET);
                     }
                 }
-                _ => println!("Usage: tlb <thread_idx> <vaddr> <paddr>"),
+                _ => println!("{}Usage: tlb <thread_idx> <vaddr> <paddr>{}", RED, RESET),
             }
         }
         "vmtest" => {
             let p1 = kmalloc(4096, 4096);
             let p2 = kmalloc(4096, 4096);
             if p1.is_null() || p2.is_null() {
-                println!("vmtest: out of memory");
+                println!("{}vmtest: out of memory{}", RED, RESET);
             } else {
                 let pa1 = p1 as u64;
                 let pa2 = p2 as u64;
@@ -1542,9 +1838,9 @@ fn handle_command(line: &str) {
                 let va: u64 = 0x80_0000_0000 + 0x10_0000;
 
                 if !thread_map_page(0, va, pa1) || !thread_map_page(1, va, pa2) {
-                    println!("vmtest: mapping failed");
+                    println!("{}vmtest: mapping failed{}", RED, RESET);
                 } else {
-                    println!("vmtest: mapped VA {:#x}", va);
+                    println!("{}vmtest: mapped VA {:#x}{}", GREEN, va, RESET);
                     println!("  thread 0 -> physical {:#x}", pa1);
                     println!("  thread 1 -> physical {:#x}", pa2);
                 }
@@ -1558,7 +1854,7 @@ fn handle_command(line: &str) {
                     None => break,
                 }
             }
-            println!("vmdemo: spawned {} isolation threads", spawned);
+            println!("{}vmdemo: spawned {} isolation threads{}", GREEN, spawned, RESET);
             println!("  Both write to VA {:#x} with different patterns.", DEMO_VA);
             println!("  After a few seconds, run 'vminfo' to see results.");
         }
@@ -1575,16 +1871,16 @@ fn handle_command(line: &str) {
         }
         "mkfs" => {
             fs_format();
-            println!("Formatted RAM filesystem ({} blocks x {} bytes = {} bytes)",
-                FS_MAX_BLOCKS, FS_BLOCK_SIZE, FS_MAX_BLOCKS * FS_BLOCK_SIZE);
+            println!("{}Formatted RAM filesystem ({} blocks x {} bytes = {} bytes){}",
+                GREEN, FS_MAX_BLOCKS, FS_BLOCK_SIZE, FS_MAX_BLOCKS * FS_BLOCK_SIZE, RESET);
         }
         "touch" => {
             if args.is_empty() {
-                println!("Usage: touch <name>");
+                println!("{}Usage: touch <name>{}", RED, RESET);
             } else {
                 match fs_create(args) {
-                    Ok(_) => println!("Created: {}", args),
-                    Err(e) => println!("touch: {}", e),
+                    Ok(_) => println!("{}Created: {}{}", GREEN, args, RESET),
+                    Err(e) => println!("{}touch: {}{}", RED, e, RESET),
                 }
             }
         }
@@ -1593,30 +1889,48 @@ fn handle_command(line: &str) {
             let name = parts2.next().unwrap_or("");
             let text = parts2.next().unwrap_or("");
             if name.is_empty() {
-                println!("Usage: writef <name> <text>");
+                println!("{}Usage: writef <name> <text>{}", RED, RESET);
             } else {
                 match fs_find(name) {
                     Some(idx) => {
                         match fs_write(idx, text.as_bytes()) {
-                            Ok(n) => println!("Wrote {} bytes to {}", n, name),
-                            Err(e) => println!("writef: {}", e),
+                            Ok(n) => println!("{}Wrote {} bytes to {}{}", GREEN, n, name, RESET),
+                            Err(e) => println!("{}writef: {}{}", RED, e, RESET),
                         }
                     }
                     None => {
                         match fs_create(name) {
                             Ok(idx) => match fs_write(idx, text.as_bytes()) {
-                                Ok(n) => println!("Created {} and wrote {} bytes", name, n),
-                                Err(e) => println!("writef: {}", e),
+                                Ok(n) => println!("{}Created {} and wrote {} bytes{}", GREEN, name, n, RESET),
+                                Err(e) => println!("{}writef: {}{}", RED, e, RESET),
                             },
-                            Err(e) => println!("writef: {}", e),
+                            Err(e) => println!("{}writef: {}{}", RED, e, RESET),
                         }
                     }
                 }
             }
         }
+        "append" => {
+            let mut parts2 = args.splitn(2, ' ');
+            let name = parts2.next().unwrap_or("");
+            let text = parts2.next().unwrap_or("");
+            if name.is_empty() {
+                println!("{}Usage: append <name> <text>{}", RED, RESET);
+            } else {
+                match fs_find(name) {
+                    Some(idx) => {
+                        match fs_append(idx, text.as_bytes()) {
+                            Ok(n) => println!("{}Appended {} bytes to {}{}", GREEN, n, name, RESET),
+                            Err(e) => println!("{}append: {}{}", RED, e, RESET),
+                        }
+                    }
+                    None => println!("{}append: {}: no such file{}", RED, name, RESET),
+                }
+            }
+        }
         "cat" => {
             if args.is_empty() {
-                println!("Usage: cat <name>");
+                println!("{}Usage: cat <name>{}", RED, RESET);
             } else {
                 match fs_find(args) {
                     Some(idx) => {
@@ -1634,23 +1948,91 @@ fn handle_command(line: &str) {
                                         }
                                     }
                                 }
-                                Err(e) => println!("cat: {}", e),
+                                Err(e) => println!("{}cat: {}{}", RED, e, RESET),
                             }
                         }
                     }
-                    None => println!("cat: {}: no such file", args),
+                    None => println!("{}cat: {}: no such file{}", RED, args, RESET),
+                }
+            }
+        }
+        "head" => {
+            let mut parts2 = args.split_whitespace();
+            let name = parts2.next().unwrap_or("");
+            let n_str = parts2.next().unwrap_or("5");
+            if name.is_empty() {
+                println!("{}Usage: head <name> [n]{}", RED, RESET);
+            } else {
+                let n = parse_u64(n_str).unwrap_or(5) as usize;
+                match fs_find(name) {
+                    Some(idx) => {
+                        let size = unsafe { FS.inodes[idx].size };
+                        if size == 0 {
+                            println!("(empty file)");
+                        } else {
+                            let mut buf = [0u8; FS_BLOCK_SIZE * FS_MAX_BLOCKS_PER_FILE];
+                            match fs_read(idx, &mut buf) {
+                                Ok(len) => {
+                                    match core::str::from_utf8(&buf[..len]) {
+                                        Ok(s) => {
+                                            let mut count = 0;
+                                            for line in s.lines() {
+                                                if count >= n { break; }
+                                                println!("{}", line);
+                                                count += 1;
+                                            }
+                                        }
+                                        Err(_) => println!("{}head: binary file{}", RED, RESET),
+                                    }
+                                }
+                                Err(e) => println!("{}head: {}{}", RED, e, RESET),
+                            }
+                        }
+                    }
+                    None => println!("{}head: {}: no such file{}", RED, name, RESET),
+                }
+            }
+        }
+        "wc" => {
+            if args.is_empty() {
+                println!("{}Usage: wc <name>{}", RED, RESET);
+            } else {
+                match fs_find(args) {
+                    Some(idx) => {
+                        let size = unsafe { FS.inodes[idx].size };
+                        if size == 0 {
+                            println!("  0   0   0 {}", args);
+                        } else {
+                            let mut buf = [0u8; FS_BLOCK_SIZE * FS_MAX_BLOCKS_PER_FILE];
+                            match fs_read(idx, &mut buf) {
+                                Ok(len) => {
+                                    match core::str::from_utf8(&buf[..len]) {
+                                        Ok(s) => {
+                                            let lines = s.lines().count();
+                                            let words = s.split_whitespace().count();
+                                            let bytes = len;
+                                            println!("{:>3} {:>3} {:>3} {}", lines, words, bytes, args);
+                                        }
+                                        Err(_) => println!("wc: binary file"),
+                                    }
+                                }
+                                Err(e) => println!("{}wc: {}{}", RED, e, RESET),
+                            }
+                        }
+                    }
+                    None => println!("{}wc: {}: no such file{}", RED, args, RESET),
                 }
             }
         }
         "ls" => {
             if !fs_is_formatted() {
-                println!("Filesystem not formatted. Run 'mkfs' first.");
+                println!("{}Filesystem not formatted. Run 'mkfs' first.{}", RED, RESET);
             } else {
                 let count = fs_count_files();
                 if count == 0 {
                     println!("(empty directory)");
                 } else {
-                    println!("NAME                             SIZE");
+                    println!("{}NAME                             SIZE{}", BOLD, RESET);
                     println!("------------------------------   ------");
                     unsafe {
                         for i in 0..FS_MAX_FILES {
@@ -1660,25 +2042,86 @@ fn handle_command(line: &str) {
                                 line[j] = FS.inodes[i].name[j];
                             }
                             let name_str = core::str::from_utf8_unchecked(&line[..30]);
-                            println!("{:<30}   {} bytes", name_str, FS.inodes[i].size);
+                            print!("{}", BLUE);
+                            print!("{:<30}", name_str);
+                            print!("{}", RESET);
+                            println!("   {} bytes", FS.inodes[i].size);
                         }
                     }
                 }
             }
         }
+        "cp" => {
+            let mut parts2 = args.split_whitespace();
+            let src = parts2.next().unwrap_or("");
+            let dst = parts2.next().unwrap_or("");
+            if src.is_empty() || dst.is_empty() {
+                println!("{}Usage: cp <src> <dst>{}", RED, RESET);
+            } else {
+                match fs_find(src) {
+                    Some(src_idx) => {
+                        if fs_find(dst).is_some() {
+                            println!("{}cp: {}: already exists{}", RED, dst, RESET);
+                        } else {
+                            match fs_create(dst) {
+                                Ok(dst_idx) => {
+                                    let mut buf = [0u8; FS_BLOCK_SIZE * FS_MAX_BLOCKS_PER_FILE];
+                                    let size = unsafe { FS.inodes[src_idx].size };
+                                    match fs_read(src_idx, &mut buf) {
+                                        Ok(n) => {
+                                            match fs_write(dst_idx, &buf[..n]) {
+                                                Ok(_) => println!("{}Copied {} -> {} ({} bytes){}", GREEN, src, dst, size, RESET),
+                                                Err(e) => println!("{}cp: {}{}", RED, e, RESET),
+                                            }
+                                        }
+                                        Err(e) => println!("{}cp: {}{}", RED, e, RESET),
+                                    }
+                                }
+                                Err(e) => println!("{}cp: {}{}", RED, e, RESET),
+                            }
+                        }
+                    }
+                    None => println!("{}cp: {}: no such file{}", RED, src, RESET),
+                }
+            }
+        }
+        "mv" => {
+            let mut parts2 = args.split_whitespace();
+            let src = parts2.next().unwrap_or("");
+            let dst = parts2.next().unwrap_or("");
+            if src.is_empty() || dst.is_empty() {
+                println!("{}Usage: mv <src> <dst>{}", RED, RESET);
+            } else {
+                match fs_find(src) {
+                    Some(idx) => {
+                        if fs_find(dst).is_some() {
+                            println!("{}mv: {}: already exists{}", RED, dst, RESET);
+                        } else {
+                            let (bytes, n) = fs_name_to_bytes(dst);
+                            unsafe {
+                                FS.inodes[idx].name = bytes;
+                                FS.inodes[idx].name_len = n;
+                            }
+                            println!("{}Renamed {} -> {}{}", GREEN, src, dst, RESET);
+                        }
+                    }
+                    None => println!("{}mv: {}: no such file{}", RED, src, RESET),
+                }
+            }
+        }
         "rm" => {
             if args.is_empty() {
-                println!("Usage: rm <name>");
+                println!("{}Usage: rm <name>{}", RED, RESET);
             } else {
                 match fs_delete(args) {
-                    Ok(_) => println!("Removed: {}", args),
-                    Err(e) => println!("rm: {}", e),
+                    Ok(_) => println!("{}Removed: {}{}", GREEN, args, RESET),
+                    Err(e) => println!("{}rm: {}{}", RED, e, RESET),
                 }
             }
         }
         "stat" => {
             if args.is_empty() {
-                println!("Usage: stat <name>");
+                println!("{}Usage: stat <name>{}", RED, RESET);
             } else {
                 match fs_find(args) {
                     Some(idx) => unsafe {
@@ -1688,7 +2131,7 @@ fn handle_command(line: &str) {
                             line[j] = inode.name[j];
                         }
                         let name_str = core::str::from_utf8_unchecked(&line[..inode.name_len]);
-                        println!("File: {}", name_str);
+                        println!("{}File: {}{}", BOLD, name_str, RESET);
                         println!("  type:   file");
                         println!("  size:   {} bytes", inode.size);
                         println!("  blocks: {}", inode.block_count);
@@ -1696,15 +2139,15 @@ fn handle_command(line: &str) {
                             println!("    block[{}] -> #{}", k, inode.blocks[k]);
                         }
                     },
-                    None => println!("stat: {}: no such file", args),
+                    None => println!("{}stat: {}: no such file{}", RED, args, RESET),
                 }
             }
         }
         "fsinfo" => {
             if !fs_is_formatted() {
-                println!("Filesystem not formatted. Run 'mkfs' first.");
+                println!("{}Filesystem not formatted. Run 'mkfs' first.{}", RED, RESET);
             } else {
-                println!("Filesystem: RAM-backed (in BSS)");
+                println!("{}Filesystem: RAM-backed (in BSS){}", BOLD, RESET);
                 println!("  magic:        {:#010x}", unsafe { FS.magic });
                 println!("  block size:   {} bytes", FS_BLOCK_SIZE);
                 println!("  total blocks: {}", FS_MAX_BLOCKS);
@@ -1713,6 +2156,16 @@ fn handle_command(line: &str) {
                 println!("  total bytes:  {}", FS_MAX_BLOCKS * FS_BLOCK_SIZE);
                 println!("  max inodes:   {}", FS_MAX_FILES);
                 println!("  files:        {}", fs_count_files());
+            }
+        }
+        "sh" => {
+            if args.is_empty() {
+                println!("{}Usage: sh <script>{}", RED, RESET);
+            } else {
+                match run_script(args) {
+                    Ok(_) => println!("{}Script '{}' finished.{}", GREEN, args, RESET),
+                    Err(e) => println!("{}sh: {}{}", RED, e, RESET),
+                }
             }
         }
         "halt" => {
@@ -1750,13 +2203,12 @@ fn handle_command(line: &str) {
             }
         }
         _ => {
-            println!("Unknown command: '{}'", cmd);
+            println!("{}Unknown command: '{}'{}", RED, cmd, RESET);
             println!("Type 'help' for a list of commands.");
         }
     }
 }
 
-/// Terminal input states for escape sequence detection
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum TermState {
     Normal,
@@ -1777,10 +2229,10 @@ extern "C" fn shell_thread() -> ! {
     thread_sleep(5);
 
     println!();
-    println!("=================================");
-    println!("     AdityaOS Shell v1.12");
-    println!("      Interactive");
-    println!("=================================");
+    println!("{}================================={}", CYAN, RESET);
+    println!("{}     AdityaOS Shell v1.16{}", BOLD, RESET);
+    println!("{}   Colors · Tabs · Scripts{}", CYAN, RESET);
+    println!("{}================================={}", CYAN, RESET);
     println!();
 
     shell_prompt();
@@ -1794,7 +2246,6 @@ extern "C" fn shell_thread() -> ! {
             }
         };
 
-        // Handle escape sequence state machine
         match term_state {
             TermState::EscapeSeen => {
                 if c == b'[' {
@@ -1807,9 +2258,7 @@ extern "C" fn shell_thread() -> ! {
             TermState::BracketSeen => {
                 match c {
                     b'A' => {
-                        // Up arrow — previous history entry
                         if !hist_browsing {
-                            // Save current line
                             saved_len = len;
                             let mut i = 0;
                             while i < len {
@@ -1834,17 +2283,14 @@ extern "C" fn shell_thread() -> ! {
                                     redraw_line(&buf, len, cursor);
                                 }
                                 None => {
-                                    // No more history; stay at oldest
                                     hist_offset -= 1;
                                 }
                             }
                         }
                     }
                     b'B' => {
-                        // Down arrow — next history entry
                         if hist_browsing {
                             if hist_offset == 0 {
-                                // Restore saved line
                                 len = saved_len;
                                 let mut i = 0;
                                 while i < len {
@@ -1875,14 +2321,12 @@ extern "C" fn shell_thread() -> ! {
                         }
                     }
                     b'C' => {
-                        // Right arrow — cursor right
                         if cursor < len {
                             cursor += 1;
                             print!("\x1b[C");
                         }
                     }
                     b'D' => {
-                        // Left arrow — cursor left
                         if cursor > 0 {
                             cursor -= 1;
                             print!("\x1b[D");
@@ -1898,11 +2342,15 @@ extern "C" fn shell_thread() -> ! {
 
         match c {
             0x1B => {
-                // ESC — start of escape sequence
                 term_state = TermState::EscapeSeen;
             }
+            0x09 => {
+                // Tab — try completion
+                let (new_len, new_cursor) = tab_complete(&buf, len);
+                len = new_len;
+                cursor = new_cursor;
+            }
             0x0D | 0x0A => {
-                // Enter
                 println!();
                 if len < MAX_LINE { buf[len] = 0; }
                 let line = unsafe { core::str::from_utf8_unchecked(&buf[..len]) };
@@ -1914,9 +2362,7 @@ extern "C" fn shell_thread() -> ! {
                 shell_prompt();
             }
             0x7F | 0x08 => {
-                // Backspace
                 if cursor > 0 {
-                    // Shift left everything after cursor
                     let mut i = cursor - 1;
                     while i < len - 1 {
                         buf[i] = buf[i + 1];
@@ -1928,9 +2374,7 @@ extern "C" fn shell_thread() -> ! {
                 }
             }
             0x01 => {
-                // Ctrl+A — cursor to start
                 cursor = 0;
-                // Move cursor to column after prompt
                 let mut back = len;
                 while back > 0 {
                     print!("\x1b[D");
@@ -1938,14 +2382,12 @@ extern "C" fn shell_thread() -> ! {
                 }
             }
             0x05 => {
-                // Ctrl+E — cursor to end
                 while cursor < len {
                     print!("\x1b[C");
                     cursor += 1;
                 }
             }
             0x03 => {
-                // Ctrl+C — cancel line
                 print!("^C");
                 println!();
                 len = 0;
@@ -1955,7 +2397,6 @@ extern "C" fn shell_thread() -> ! {
                 shell_prompt();
             }
             0x0C => {
-                // Ctrl+L — clear screen
                 clear_screen();
                 shell_prompt();
                 let mut i = 0;
@@ -1963,7 +2404,6 @@ extern "C" fn shell_thread() -> ! {
                     Uart.putc(buf[i]);
                     i += 1;
                 }
-                // Reposition cursor
                 let mut back = len - cursor;
                 while back > 0 {
                     print!("\x1b[D");
@@ -1971,25 +2411,20 @@ extern "C" fn shell_thread() -> ! {
                 }
             }
             0x15 => {
-                // Ctrl+U — clear line
                 len = 0;
                 cursor = 0;
                 redraw_line(&buf, len, cursor);
             }
             0x17 => {
-                // Ctrl+W — delete last word
                 if cursor > 0 {
-                    // Skip trailing spaces
                     let mut end = cursor;
                     while end > 0 && buf[end - 1] == b' ' {
                         end -= 1;
                     }
-                    // Skip non-spaces
                     let mut start = end;
                     while start > 0 && buf[start - 1] != b' ' {
                         start -= 1;
                     }
-                    // Delete range [start, cursor)
                     let delete_count = cursor - start;
                     let mut i = start;
                     while i + delete_count < len {
@@ -2002,16 +2437,13 @@ extern "C" fn shell_thread() -> ! {
                 }
             }
             0x20..=0x7E => {
-                // Printable character — insert at cursor
                 if len < MAX_LINE - 1 {
                     if cursor == len {
-                        // Append at end — simple case
                         buf[len] = c;
                         len += 1;
                         cursor += 1;
                         Uart.putc(c);
                     } else {
-                        // Insert in middle — shift right
                         let mut i = len;
                         while i > cursor {
                             buf[i] = buf[i - 1];
@@ -2036,7 +2468,7 @@ extern "C" fn shell_thread() -> ! {
 #[no_mangle]
 pub extern "C" fn rust_exception_handler(esr: u64, elr: u64, far: u64) {
     clear_screen();
-    println!("=== AdityaOS Exception ===");
+    println!("{}=== AdityaOS Exception ==={}", RED, RESET);
     println!("  ESR_EL1: {:#018x}", esr);
     println!("  ELR_EL1: {:#018x}", elr);
     println!("  FAR_EL1: {:#018x}", far);
@@ -2121,8 +2553,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.12\n", 3);
-    print_slow("      Interactive\n", 3);
+    print_slow("       AdityaOS v1.16\n", 3);
+    print_slow("   Colors · Tabs · Scripts\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
