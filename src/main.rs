@@ -48,9 +48,7 @@ const RED:     &str = "\x1b[31m";
 const GREEN:   &str = "\x1b[32m";
 const YELLOW:  &str = "\x1b[33m";
 const BLUE:    &str = "\x1b[34m";
-const MAGENTA: &str = "\x1b[35m";
 const CYAN:    &str = "\x1b[36m";
-const WHITE:   &str = "\x1b[37m";
 
 // ============================================================
 // UART
@@ -683,10 +681,8 @@ fn fs_append(idx: usize, data: &[u8]) -> Result<usize, &'static str> {
             return Err("file too large (max 4 blocks = 2KB)");
         }
 
-        // Determine current block count (may need to grow)
         let old_block_count = FS.inodes[idx].block_count;
 
-        // Allocate new blocks if needed
         let mut block_num = old_block_count;
         while block_num < needed_blocks {
             let blk = match fs_find_free_block() {
@@ -697,7 +693,6 @@ fn fs_append(idx: usize, data: &[u8]) -> Result<usize, &'static str> {
             block_num += 1;
         }
 
-        // Write bytes at old_size position
         let mut remaining = data.len();
         let mut src_off = 0;
         let mut pos = old_size;
@@ -899,11 +894,12 @@ pub enum ThreadState {
 
 #[repr(C)]
 pub struct Context {
-    pub x: [u64; 31],
-    pub sp: u64,
-    pub elr: u64,
-    pub spsr: u64,
-    pub wake_at: u64,
+    pub x: [u64; 31],      // x0..x30
+    pub sp: u64,           // kernel stack pointer (SP_EL1 when EL1t, or SP for EL1h)
+    pub elr: u64,          // exception link register (return PC)
+    pub spsr: u64,         // saved program status (mode, flags)
+    pub wake_at: u64,      // tick count at which Sleeping threads become Ready
+    pub sp_el0: u64,       // user stack pointer (used only when running at EL0)
 }
 
 const STACK_SIZE: usize = 16 * 1024;
@@ -924,14 +920,14 @@ static STACK_S4: Stack = Stack([0; STACK_SIZE]);
 static STACK_S5: Stack = Stack([0; STACK_SIZE]);
 
 static mut CTX: [Context; MAX_THREADS] = [
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
 ];
 
 static mut STATE: [ThreadState; MAX_THREADS] = [ThreadState::Unused; MAX_THREADS];
@@ -1037,6 +1033,7 @@ fn spawn_lifecycle_in_slot(slot: usize) -> bool {
         CTX[slot].elr = spawned_lifecycle_thread as *const () as usize as u64;
         CTX[slot].spsr = 0x5;
         CTX[slot].wake_at = 0;
+        CTX[slot].sp_el0 = 0;
         STATE[slot] = ThreadState::Ready;
     }
     true
@@ -1133,6 +1130,7 @@ fn spawn_vm_demo() -> Option<usize> {
         CTX[slot].elr = vm_demo_thread as *const () as usize as u64;
         CTX[slot].spsr = 0x5;
         CTX[slot].wake_at = 0;
+        CTX[slot].sp_el0 = 0;
         STATE[slot] = ThreadState::Ready;
     }
     Some(slot)
@@ -1269,16 +1267,11 @@ const COMMANDS: &[&str] = &[
     "echo", "sleep", "history", "spam", "sh", "halt", "shutdown", "reboot", "panic",
 ];
 
-/// Commands that take a filename as their first argument
 const FILE_COMMANDS: &[&str] = &[
     "cat", "rm", "stat", "writef", "append", "head", "wc", "cp", "mv", "sh",
 ];
 
-/// Tab completion. Given the current buffer contents, return a completed version.
-/// Called when Tab (0x09) is pressed.
-/// Returns (new_buf, new_len, new_cursor).
 fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
-    // Split into first word (command) and rest
     let mut first_space = len;
     let mut i = 0;
     while i < len {
@@ -1290,11 +1283,9 @@ fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
     }
 
     if first_space == len {
-        // Only one word so far — complete command name
         let prefix = unsafe { core::str::from_utf8_unchecked(&buf[..len]) };
         if prefix.is_empty() { return (len, len); }
 
-        // Find all matches
         let mut matches: [&str; 8] = [""; 8];
         let mut match_count = 0;
         for cmd in COMMANDS {
@@ -1307,25 +1298,17 @@ fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
         }
 
         if match_count == 0 {
-            // No match — bell
             Uart.putc(0x07);
             return (len, len);
         } else if match_count == 1 {
-            // Unique match — replace the buffer
             let m = matches[0];
             let bytes = m.as_bytes();
             let new_len = bytes.len();
-            // Copy to buffer... but we can't write to buf here since it's &[u8]
-            // We'll do the writing in the caller instead.
-            // Return new_len as a signal; the caller will redraw.
-            // For simplicity, we print the completion directly and return the new length.
-            // Move cursor back to start of word
             let mut j = 0;
             while j < len {
                 print!("\x1b[D");
                 j += 1;
             }
-            // Print the completion
             let mut k = 0;
             while k < new_len {
                 Uart.putc(bytes[k]);
@@ -1333,7 +1316,6 @@ fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
             }
             return (new_len, new_len);
         } else {
-            // Multiple matches — print them below
             println!();
             let mut j = 0;
             while j < match_count {
@@ -1341,7 +1323,6 @@ fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
                 j += 1;
             }
             println!();
-            // Redraw prompt + current buffer
             print!("{}adityaos>{} ", CYAN, RESET);
             let mut k = 0;
             while k < len {
@@ -1351,14 +1332,12 @@ fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
             return (len, len);
         }
     } else {
-        // We have "command arg..." — complete filename if command expects one
         let cmd = unsafe { core::str::from_utf8_unchecked(&buf[..first_space]) };
         if !FILE_COMMANDS.contains(&cmd) {
             Uart.putc(0x07);
             return (len, len);
         }
 
-        // Find the current partial argument (after last space)
         let mut arg_start = first_space + 1;
         let mut j = first_space + 1;
         while j < len {
@@ -1368,7 +1347,6 @@ fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
             j += 1;
         }
 
-        // Only complete the first arg for now
         if arg_start != first_space + 1 {
             Uart.putc(0x07);
             return (len, len);
@@ -1376,9 +1354,7 @@ fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
 
         let partial = unsafe { core::str::from_utf8_unchecked(&buf[arg_start..len]) };
 
-        // Find matching filenames
         let mut found_first = false;
-        let mut unique_match = false;
         let mut match_name: [u8; 32] = [0; 32];
         let mut match_name_len = 0;
         let mut match_count = 0;
@@ -1399,8 +1375,6 @@ fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
                             match_name[m] = name_bytes[m];
                             m += 1;
                         }
-                    } else {
-                        unique_match = false;
                     }
                 }
             }
@@ -1409,28 +1383,14 @@ fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
         if match_count == 0 {
             Uart.putc(0x07);
             return (len, len);
-        } else if match_count == 1 && unique_match {
-            // Print the completion (rest of the name)
-            let to_print = match_name_len - partial.len();
-            let mut m = partial.len();
-            while m < match_name_len {
-                Uart.putc(match_name[m]);
-                m += 1;
-            }
-            let _ = to_print;
-            return (match_name_len + arg_start, match_name_len + arg_start);
         } else if match_count == 1 {
-            // Found exactly one match (unique_match was false because we didn't loop a second time)
-            let to_print = match_name_len - partial.len();
             let mut m = partial.len();
             while m < match_name_len {
                 Uart.putc(match_name[m]);
                 m += 1;
             }
-            let _ = to_print;
             return (match_name_len + arg_start, match_name_len + arg_start);
         } else {
-            // Multiple matches — bell only, to keep it simple
             Uart.putc(0x07);
             return (len, len);
         }
@@ -2230,8 +2190,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("{}================================={}", CYAN, RESET);
-    println!("{}     AdityaOS Shell v1.16{}", BOLD, RESET);
-    println!("{}   Colors · Tabs · Scripts{}", CYAN, RESET);
+    println!("{}     AdityaOS Shell v1.17a{}", BOLD, RESET);
+    println!("{}   User Mode: Infrastructure{}", CYAN, RESET);
     println!("{}================================={}", CYAN, RESET);
     println!();
 
@@ -2345,7 +2305,6 @@ extern "C" fn shell_thread() -> ! {
                 term_state = TermState::EscapeSeen;
             }
             0x09 => {
-                // Tab — try completion
                 let (new_len, new_cursor) = tab_complete(&buf, len);
                 len = new_len;
                 cursor = new_cursor;
@@ -2553,8 +2512,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.16\n", 3);
-    print_slow("   Colors · Tabs · Scripts\n", 3);
+    print_slow("       AdityaOS v1.17a\n", 3);
+    print_slow("   User Mode: Infrastructure\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
