@@ -894,12 +894,12 @@ pub enum ThreadState {
 
 #[repr(C)]
 pub struct Context {
-    pub x: [u64; 31],      // x0..x30
-    pub sp: u64,           // kernel stack pointer (SP_EL1 when EL1t, or SP for EL1h)
-    pub elr: u64,          // exception link register (return PC)
-    pub spsr: u64,         // saved program status (mode, flags)
-    pub wake_at: u64,      // tick count at which Sleeping threads become Ready
-    pub sp_el0: u64,       // user stack pointer (used only when running at EL0)
+    pub x: [u64; 31],      // x0..x30              0x00
+    pub sp: u64,           // kernel stack pointer 0xF8
+    pub elr: u64,          // exception link reg   0x100
+    pub spsr: u64,         // saved PSTATE         0x108
+    pub sp_el0: u64,       // user stack pointer   0x110
+    pub wake_at: u64,      // wake-up tick         0x118
 }
 
 const STACK_SIZE: usize = 16 * 1024;
@@ -920,14 +920,14 @@ static STACK_S4: Stack = Stack([0; STACK_SIZE]);
 static STACK_S5: Stack = Stack([0; STACK_SIZE]);
 
 static mut CTX: [Context; MAX_THREADS] = [
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
-    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, wake_at: 0, sp_el0: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, sp_el0: 0, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, sp_el0: 0, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, sp_el0: 0, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, sp_el0: 0, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, sp_el0: 0, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, sp_el0: 0, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, sp_el0: 0, wake_at: 0 },
+    Context { x: [0; 31], sp: 0, elr: 0, spsr: 0x5, sp_el0: 0, wake_at: 0 },
 ];
 
 static mut STATE: [ThreadState; MAX_THREADS] = [ThreadState::Unused; MAX_THREADS];
@@ -1032,8 +1032,8 @@ fn spawn_lifecycle_in_slot(slot: usize) -> bool {
         CTX[slot].sp = stack_base as u64 + STACK_SIZE as u64;
         CTX[slot].elr = spawned_lifecycle_thread as *const () as usize as u64;
         CTX[slot].spsr = 0x5;
-        CTX[slot].wake_at = 0;
         CTX[slot].sp_el0 = 0;
+        CTX[slot].wake_at = 0;
         STATE[slot] = ThreadState::Ready;
     }
     true
@@ -1129,8 +1129,8 @@ fn spawn_vm_demo() -> Option<usize> {
         CTX[slot].sp = stack_base as u64 + STACK_SIZE as u64;
         CTX[slot].elr = vm_demo_thread as *const () as usize as u64;
         CTX[slot].spsr = 0x5;
-        CTX[slot].wake_at = 0;
         CTX[slot].sp_el0 = 0;
+        CTX[slot].wake_at = 0;
         STATE[slot] = ThreadState::Ready;
     }
     Some(slot)
@@ -1254,10 +1254,6 @@ fn strlen_at(addr: u64) -> usize {
     }
     n
 }
-
-// ============================================================
-// Command table (for tab completion)
-// ============================================================
 
 const COMMANDS: &[&str] = &[
     "help", "clear", "ticks", "uptime", "time", "threads", "tasks", "el", "regs", "irqs",
@@ -1397,10 +1393,6 @@ fn tab_complete(buf: &[u8], len: usize) -> (usize, usize) {
     }
 }
 
-// ============================================================
-// Script runner
-// ============================================================
-
 fn run_script(name: &str) -> Result<(), &'static str> {
     if !fs_is_formatted() {
         return Err("filesystem not formatted");
@@ -1434,10 +1426,6 @@ fn run_script(name: &str) -> Result<(), &'static str> {
         Err(e) => Err(e),
     }
 }
-
-// ============================================================
-// Command dispatch
-// ============================================================
 
 fn handle_command(line: &str) {
     let trimmed = line.trim();
@@ -2190,8 +2178,8 @@ extern "C" fn shell_thread() -> ! {
 
     println!();
     println!("{}================================={}", CYAN, RESET);
-    println!("{}     AdityaOS Shell v1.17a{}", BOLD, RESET);
-    println!("{}   User Mode: Infrastructure{}", CYAN, RESET);
+    println!("{}     AdityaOS Shell v1.17b{}", BOLD, RESET);
+    println!("{}   SVC Handler Installed{}", CYAN, RESET);
     println!("{}================================={}", CYAN, RESET);
     println!();
 
@@ -2424,6 +2412,23 @@ extern "C" fn shell_thread() -> ! {
 // Exception + IRQ
 // ============================================================
 
+/// Called from boot.S when EL0 code executes `svc`.
+/// `svc_imm` = the immediate from the svc instruction (ESR_EL1[15:0])
+/// `ctx` = pointer to the current thread's Context
+/// Returns the value to place into the user's x0 register.
+#[no_mangle]
+pub extern "C" fn rust_svc_handler(svc_imm: u64, _ctx: *mut Context) -> u64 {
+    // No EL0 threads exist yet — this should never fire.
+    println!();
+    println!("{}=== SVC received ==={}", YELLOW, RESET);
+    println!("  svc immediate: {}", svc_imm);
+    println!("  But no EL0 threads exist yet!");
+    println!("  This should not happen.");
+    println!();
+    println!("System halted.");
+    loop { core::hint::spin_loop(); }
+}
+
 #[no_mangle]
 pub extern "C" fn rust_exception_handler(esr: u64, elr: u64, far: u64) {
     clear_screen();
@@ -2512,8 +2517,8 @@ pub extern "C" fn kmain() -> ! {
     clear_screen();
 
     print_slow("=================================\n", 3);
-    print_slow("       AdityaOS v1.17a\n", 3);
-    print_slow("   User Mode: Infrastructure\n", 3);
+    print_slow("       AdityaOS v1.17b\n", 3);
+    print_slow("   SVC Handler Installed\n", 3);
     print_slow("=================================\n", 3);
     println!();
     println!("Running at EL{}", current_el());
