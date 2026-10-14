@@ -1,8 +1,8 @@
 # AdityaOS
 
-A small bare-metal operating system for **AArch64 (ARM64)**, written from scratch in **Rust and assembly**.
+A small bare-metal operating system for **AArch64 (ARM64)**, written from scratch in Rust and assembly.
 
-AdityaOS boots directly on QEMU's `virt` machine, without Linux or another operating system underneath. It currently includes a preemptive multitasking kernel, interrupt-driven scheduling, an interactive shell, UART I/O, and basic hardware inspection tools.
+AdityaOS boots directly on QEMU's `virt` machine — no Linux, no OS underneath. It runs a preemptive multitasking kernel with virtual memory, per-thread address spaces, a RAM filesystem, and an interactive shell.
 
 Built by **Aditya** from Visakhapatnam, India.
 
@@ -10,235 +10,271 @@ Built by **Aditya** from Visakhapatnam, India.
 
 ## Features
 
-- Bare-metal AArch64 (ARM64) kernel
-- Custom assembly boot code
-- Custom linker script and memory layout
-- PL011 UART driver for terminal input/output
-- `print!` and `println!` macros through `core::fmt::Write`
-- AArch64 exception vector table
-- Synchronous exception and IRQ handling
-- GICv2 interrupt controller support
-- ARM Generic Timer configuration
-- Preemptive multitasking
-- Round-robin thread scheduler
-- Runtime thread spawning
-- Interactive kernel shell
-- Command history
-- Memory inspection
-- CPU register/state inspection
-- Kernel panic handler with fault-address reporting
-- PSCI-based system reset
+- **Bare-metal AArch64 kernel** — boots on QEMU `virt`, no host OS
+- **Custom boot code** — assembly entry point, exception vector table, exception handlers
+- **PL011 UART driver** — terminal input and output via MMIO
+- **Formatted output** — `print!` and `println!` macros through `core::fmt::Write`
+- **Interrupt handling** — GICv2 configuration, ARM Generic Timer, UART RX interrupts
+- **Preemptive multitasking** — round-robin scheduler with full context switching
+- **Per-thread page tables** — each thread has its own L0 page table
+- **MMU enabled** — 4-level page tables (L0 → L1 → L2 → L3), identity-mapped kernel
+- **Virtual memory isolation** — two threads can write to the same virtual address and see different data
+- **Sleeping threads** — `wfi`-based idle, scheduler wakes on time
+- **Dynamic thread spawning** — create threads at runtime, slot reuse on exit
+- **Memory allocator** — bump allocator over a reserved heap region
+- **RAM filesystem** — inodes, blocks, files (mkfs, touch, writef, cat, ls, cp, mv, rm, stat)
+- **Script runner** — execute command files from the filesystem (sh)
+- **Interactive shell** — history navigation, tab completion, line editing, ANSI colors
+- **Easter eggs** — sudo, coffee, 42, and more
+- **ASCII animation** — spinning donut
+- **Text game** — moonlander
+- **Clean shutdown** — PSCI-based power off and reset
 
 ---
 
-## Shell
+## Shell commands
 
-AdityaOS includes an interactive shell running as a kernel thread.
+### System
 
 | Command | Description |
-|---|---|
-| `help` | List available commands |
-| `clear` | Clear the terminal |
-| `ticks` | Show the timer tick count |
-| `uptime` / `time` | Show seconds since boot |
-| `threads` | Show thread count, current thread, and context-switch count |
-| `el` | Show the current exception level |
-| `regs` | Dump CPU state including SP, ELR, SPSR, and CurrentEL |
-| `echo <text>` | Print text to the terminal |
-| `sleep <ms>` | Sleep for the specified number of milliseconds |
-| `mem <addr>` | Dump 128 bytes starting at a hexadecimal address |
-| `history` | Show recent commands |
-| `spawn` | Create a new kernel thread at runtime |
-| `panic` | Trigger a kernel panic for testing |
-| `reboot` | Reset the machine through PSCI |
+|---------|-------------|
+| help | Show all commands |
+| clear | Clear the screen |
+| ticks | Timer tick count |
+| uptime | Uptime as HH:MM:SS |
+| el | Current exception level |
+| regs | CPU state (SP, ELR, SPSR) |
+| irqs | Interrupt counts |
+| mmu | MMU register values |
+| ptdump | Kernel page table dump |
+
+### Threads
+
+| Command | Description |
+|---------|-------------|
+| threads | Thread and scheduler info |
+| tasks | Per-thread state table |
+| spawn | Spawn one lifecycle thread |
+| spawnmany `<n>` | Spawn up to N threads |
+
+### Memory
+
+| Command | Description |
+|---------|-------------|
+| mem `<addr>` | Dump 128 bytes |
+| dump `<addr> <len>` | Dump len bytes |
+| write `<addr> <hex>` | Write hex bytes |
+| memset `<addr> <byte> <len>` | Fill memory |
+| strlen `<addr>` | String length |
+| alloc `<size>` | Allocate memory |
+| heap | Heap statistics |
+
+### Virtualization
+
+| Command | Description |
+|---------|-------------|
+| vmtest | Set up isolation mappings |
+| vmdemo | Two threads, same VA, different data |
+| vminfo | Show last vmdemo results |
+| tlb `<idx> <vaddr> <paddr>` | Map vaddr to paddr for a thread |
+| ttbr `<idx>` | Show thread's TTBR0 |
+
+### Filesystem
+
+| Command | Description |
+|---------|-------------|
+| mkfs | Format RAM filesystem |
+| touch `<name>` | Create empty file |
+| writef `<name> <text>` | Write text to file |
+| append `<name> <text>` | Append text to file |
+| cat `<name>` | Print file contents |
+| head `<name> [n]` | First n lines |
+| wc `<name>` | Line, word, byte count |
+| ls | List files |
+| cp `<src> <dst>` | Copy file |
+| mv `<src> <dst>` | Rename file |
+| rm `<name>` | Delete file |
+| stat `<name>` | File info |
+| fsinfo | Filesystem statistics |
+| sh `<script>` | Run a script |
+
+### Terminal shortcuts
+
+| Key | Action |
+|-----|--------|
+| Tab | Complete command or filename |
+| Up / Down | History navigation |
+| Ctrl+A / Ctrl+E | Cursor to start/end |
+| Ctrl+U | Clear line |
+| Ctrl+W | Delete last word |
+| Ctrl+L | Clear screen |
+| Ctrl+C | Cancel line |
+
+### Fun
+
+| Command | Description |
+|---------|-------------|
+| donut | ASCII spinning donut |
+| moonlander | Text-based landing game |
+| sudo | Easter egg |
+| coffee | HTTP 418 |
+| 42 | The Answer |
+
+### Control
+
+| Command | Description |
+|---------|-------------|
+| halt | Stop the CPU |
+| shutdown | Power off via PSCI |
+| reboot | Reset via PSCI |
+| panic | Trigger a kernel panic |
 
 ---
 
 ## Requirements
 
-- Rust nightly
-- `aarch64-unknown-none` Rust target
-- QEMU 8.x or newer
-- `aarch64-linux-gnu-gcc`
-- AArch64 binutils
+- Rust nightly with the `aarch64-unknown-none` target
+- QEMU 8.x or newer (`qemu-system-aarch64`)
+- AArch64 cross-toolchain: `aarch64-linux-gnu-gcc`, `binutils-aarch64-linux-gnu`
 
 ### Ubuntu / WSL2
 
-Install the required packages:
-
-```bash
-sudo apt update
-sudo apt install build-essential qemu-system-arm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-```
-
-Install Rust using `rustup` if it is not already installed:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Then install the AArch64 bare-metal target:
-
-```bash
-rustup target add aarch64-unknown-none
-```
+    sudo apt update
+    sudo apt install build-essential qemu-system-arm gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+    rustup target add aarch64-unknown-none
 
 ---
 
-## Build and Run
+## Build and run
 
-Clone the repository and run:
+    ./build.sh
 
-```bash
-./build.sh
-```
-
-The build script compiles the kernel and launches it in QEMU.
-
-To exit QEMU:
-
-```text
-Ctrl + A
-```
-
-Release the keys, then press:
-
-```text
-X
-```
+This compiles the kernel and launches it in QEMU. To exit QEMU, press `Ctrl + A`, release, then `X`.
 
 ---
 
-## Project Layout
+## How it works
 
-```text
-AdityaOS/
-├── .cargo/
-│   └── config.toml       # Cargo target and linker configuration
-├── build.rs              # Assembles boot.S and configures the build
-├── linker.ld             # Kernel memory layout
-├── build.sh              # Build and run script
-├── LICENSE               # MIT License
-└── src/
-    ├── boot.S            # AArch64 entry point, vectors, and IRQ handling
-    └── main.rs           # Kernel, UART, GIC, timer, scheduler, and shell
-```
+### Boot
 
----
+QEMU loads the kernel at `0x4008_0000` and jumps to `_start` in `boot.S`. The assembly boot code:
 
-## How It Works
+1. Sets up the initial stack
+2. Zeros the BSS section
+3. Installs the exception vector table in `VBAR_EL1`
+4. Enables FP/SIMD
+5. Jumps to the Rust entry point
 
-### 1. Boot
+### Kernel initialization
 
-QEMU loads the kernel at `0x40080000` and transfers execution to `_start` in `boot.S`.
+`kmain` sets up:
 
-The assembly boot code:
+1. **Heap** — 112 MB bump allocator at `0x4800_0000`
+2. **Page tables** — kernel identity map, per-thread L0 tables
+3. **GIC** — interrupt controller, enables timer and UART IRQs
+4. **Timer** — ARM Generic Timer, 100ms tick
+5. **Scheduler** — thread table with 8 slots
+6. **UART RX interrupts** — interrupt-driven input
+7. **MMU** — enables address translation
 
-- Sets up the initial stack
-- Clears the BSS section
-- Installs the exception vector table
-- Configures `VBAR_EL1`
-- Transfers control to the Rust kernel
+### Scheduler
 
-### 2. Kernel Initialization
+Round-robin, preemptive. On every other timer tick (200ms), the current thread's context is saved and the next ready thread's context is restored. If a thread is sleeping, the scheduler skips it until its wake time.
 
-Rust's `kmain` initializes the core hardware:
+### Virtual memory
 
-- PL011 UART
-- GICv2 interrupt controller
-- ARM Generic Timer
-- Exception handling
+Each thread has its own L0 page table. The kernel identity-maps the low 2GB for hardware access. Each thread can add private mappings in the 512GB–1TB range (L0 index 1). Context switches update `TTBR0_EL1` and flush the TLB.
 
-The timer is configured to generate periodic interrupts, allowing the kernel to perform scheduling.
+### Filesystem
 
-### 3. Preemptive Scheduler
+In-memory filesystem with fixed-size inode and data block tables:
 
-AdityaOS uses a **round-robin scheduler**.
+- 32 inode slots
+- 64 data blocks of 512 bytes (32 KB total)
+- Each file can use up to 4 blocks (2 KB max)
+- Unix-style semantics: inode, size, block pointers
 
-Timer IRQs periodically invoke the scheduler. When a context switch occurs, the current CPU state is saved into the thread's `Context` structure and the next runnable thread's context is restored.
-
-This allows multiple kernel threads to execute without each thread having to voluntarily yield.
-
-### 4. Shell
-
-The shell runs as a kernel thread and communicates directly with the PL011 UART.
-
-Input is read from the UART receive FIFO, parsed into commands, and dispatched to the corresponding kernel functionality.
+Everything lives in BSS — no disk, no persistence across reboot.
 
 ---
 
-## Architecture
+## Project layout
 
-```text
-                    QEMU virt
-                       │
-                       ▼
-                ┌──────────────┐
-                │    boot.S    │
-                │ AArch64 boot │
-                └──────┬───────┘
-                       │
-                       ▼
-                ┌──────────────┐
-                │    Kernel    │
-                │    Rust      │
-                └──────┬───────┘
-                       │
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-       PL011          GICv2      Generic Timer
-        UART          IRQs          │
-          │            │            │
-          └────────────┴─────┬──────┘
-                             ▼
-                    ┌────────────────┐
-                    │  Scheduler     │
-                    │ Round-robin    │
-                    └───────┬────────┘
-                            │
-                 ┌──────────┼──────────┐
-                 ▼          ▼          ▼
-              Shell      Thread 1   Thread 2
-```
+    AdityaOS/
+    ├── .cargo/config.toml      Cargo target and linker flags
+    ├── build.rs                Assembles src/boot.S and links it
+    ├── linker.ld               Memory layout at 0x40080000
+    ├── build.sh                Build and run script
+    └── src/
+        ├── boot.S              Entry point, exception vectors, SVC handler
+        └── main.rs             Kernel: UART, MMU, scheduler, shell, filesystem
 
 ---
 
-## Known Limitations
+## Known limitations
 
-AdityaOS is intentionally small and is still an experimental kernel.
-
-- No MMU or virtual memory yet
-- No user mode; kernel code currently runs at EL1
-- No process isolation
-- Threads cannot currently exit or be joined
-- Spawned threads currently run indefinitely
-- UART input is polling-based rather than interrupt-driven
-- No filesystem
-- No persistent storage
+- No user mode (EL0) — everything runs at EL1
+- No fork/exec — threads run in the kernel's address space
+- No persistent storage — filesystem is RAM-only
+- Single core — no SMP
 - No networking
-- No SMP/multicore support yet
+- Fixed-size filesystem (32 files, 32 KB)
 
 ---
 
 ## Roadmap
 
-Possible future improvements include:
+- [ ] User mode (EL0) + syscalls
+- [ ] fork / exec
+- [ ] Persistent storage (SD card on Raspberry Pi)
+- [ ] Port to Raspberry Pi 3B+
+- [ ] Multi-core support
+- [ ] Networking
 
-- [ ] MMU and virtual memory
-- [ ] EL0 user-mode programs
-- [ ] System calls
-- [ ] Thread termination and joining
-- [ ] Interrupt-driven UART input
-- [ ] Heap allocator
-- [ ] Filesystem
-- [ ] SMP / multicore support
-- [ ] User-space shell
-- [ ] More hardware drivers
+---
+
+## Version history
+
+Every major version is tagged:
+
+    git tag                        # list all tags
+    git checkout v1.16-clean       # restore a known-good state
+
+| Tag | What it added |
+|-----|---------------|
+| v1.0-clean | Boot, UART, timer, interrupts |
+| v1.1-clean | Shell extensions (regs, mem, history) |
+| v1.2-clean | Thread lifecycle + spawn |
+| v1.3-clean | 8-slot thread table |
+| v1.4-clean | UART RX interrupts |
+| v1.5-clean | Sleeping threads (WFI) |
+| v1.6-clean | Memory allocator |
+| v1.7-clean | Debug command pack |
+| v1.8c-clean | MMU enabled |
+| v1.9-clean | Per-thread page tables |
+| v1.10-clean | VM isolation demo |
+| v1.11-clean | RAM filesystem |
+| v1.12-clean | Interactive terminal |
+| v1.16-clean | Colors, tabs, scripts |
+| v1.18-clean | Easter eggs, donut, moonlander |
+
+---
+
+## Credits
+
+The overall approach — boot flow, exception vector layout, GICv2 setup, context switch structure, and page table design — was learned from studying open-source AArch64 kernel projects and the OSDev community:
+
+- [rust-microkernel](https://github.com/bahree/rust-microkernel) by Amit Bahree
+- [raspberry-pi-os](https://github.com/s-matyukevich/raspberry-pi-os) by Sergey Matyukevich
+- [OSDev Wiki](https://wiki.osdev.org/)
+- [ARM Architecture Reference Manual](https://developer.arm.com/documentation/ddi0487/latest/)
+
+The donut animation is based on the classic `donut.c` by Andy Sloane.
+
+All code in this repository was written from scratch by the author.
 
 ---
 
 ## License
 
-AdityaOS is released under the **MIT License**.
-
-See [`LICENSE`](LICENSE) for the full license text.
+MIT — see [LICENSE](LICENSE) for details.
